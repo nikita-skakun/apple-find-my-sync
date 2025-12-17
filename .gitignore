@@ -1,0 +1,4 @@
+.venv/
+apple_find_my_sync.egg-info/
+uv.lock
+venv/

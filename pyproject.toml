@@ -1,0 +1,24 @@
+[project]
+name = "apple-find-my-sync"
+version = "0.1.0"
+readme = "README.md"
+requires-python = ">=3.13"
+description = "A set of tools to interact with the Apple Find My network."
+dependencies = [
+	"findmy>=0.9.7",
+	"setuptools>=80.9.0",
+]
+classifiers = ["Private :: Do Not Upload"]
+
+[project.scripts]
+microservice = "microservice:main"
+
+[tool.uv]
+package = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["*"]
+
+[tool.setuptools]
+py-modules = ["microservice"]

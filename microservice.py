@@ -198,23 +198,16 @@ def main():
 #     scan_device = None
 
 #     async for device in scanner.scan_for(10, extend_timeout=True):
-#         if isinstance(device, NearbyOfflineFindingDevice):
-#             _print_nearby(device)
-#         elif isinstance(device, SeparatedOfflineFindingDevice):
-#             _print_separated(device)
-#         else:
-#             print(f"Unknown device: {device}")
-#             print()
-#             continue
-
 #         if check_key and device.is_from(check_key):
 #             scan_device = device
 
 #     print()
 #     if scan_device:
-#         print("Device was found in scan results! :D")
-#     elif check_key:
-#         print("Device was not found in scan results... :c")
+#         print("Found matching device!\n")
+#         if isinstance(scan_device, NearbyOfflineFindingDevice):
+#             _print_nearby(scan_device)
+#         elif isinstance(scan_device, SeparatedOfflineFindingDevice):
+#             _print_separated(scan_device)
 
 #     return scan_device is not None and check_key is not None
 

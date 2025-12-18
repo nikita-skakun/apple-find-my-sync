@@ -2,3 +2,7 @@
 apple_find_my_sync.egg-info/
 uv.lock
 venv/
+__pycache__/
+ani_libs.bin
+airtag.json
+account.json

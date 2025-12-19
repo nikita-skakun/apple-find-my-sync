@@ -6,6 +6,7 @@ import logging
 import os
 import httpx
 from typing import Any, cast
+from datetime import datetime, timezone
 
 from findmy import (  # pyright: ignore[reportMissingTypeStubs]
     AsyncAppleAccount,
@@ -110,6 +111,30 @@ async def main_sync():
 
     # step 2: fetch reports!
     locations = await acc.fetch_location_history(airtag)
+
+    alignment_dt = airtag._alignment_date  # pyright: ignore[reportPrivateUsage]
+
+    def _ensure_aware(dt: datetime) -> datetime:
+        return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+    alignment_dt = _ensure_aware(alignment_dt)
+    before_count = len(locations)
+    filtered: list[LocationReport] = []
+    for loc in locations:
+        try:
+            loc_ts = _ensure_aware(loc.timestamp)
+            if loc_ts > alignment_dt:
+                filtered.append(loc)
+        except Exception:
+            # If anything goes wrong comparing timestamps, keep the location
+            logging.exception("Error while comparing location timestamp; keeping location")
+            filtered.append(loc)
+    skipped = before_count - len(filtered)
+    if skipped:
+        logging.info(
+            f"Skipping {skipped} location(s) older than alignment_date={alignment_dt.isoformat()}"
+        )
+    locations = filtered
 
     device_id = airtag.identifier
     if not device_id:

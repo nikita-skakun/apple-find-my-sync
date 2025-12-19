@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Sequence
 import logging
 import os
 import httpx
-from typing import Any
+from typing import Any, cast
 
 from findmy import (  # pyright: ignore[reportMissingTypeStubs]
     AsyncAppleAccount,
@@ -27,11 +28,11 @@ async def _login_async(account: AsyncAppleAccount) -> None:
     email = input("email?  > ")
     password = input("passwd? > ")
 
-    state = await account.login(email, password)
+    state = cast(LoginState, await account.login(email, password)) # pyright: ignore[reportUnknownMemberType]
 
     if state == LoginState.REQUIRE_2FA:  # Account requires 2FA
         # This only supports SMS methods for now
-        methods = await account.get_2fa_methods()
+        methods = cast(Sequence[Any], await account.get_2fa_methods()) # pyright: ignore[reportUnknownMemberType]
 
         # Print the (masked) phone numbers
         for i, method in enumerate(methods):
@@ -84,12 +85,12 @@ def _upload_location(device_id: str, location: LocationReport) -> bool:
         code = getattr(resp, "status_code", None)
         if code and 200 <= code < 300:
             logging.info(
-                f"Push succeeded for {device_id}, status: {code}, report_id={location.hashed_adv_key_b64}"
+                f"Push succeeded for {device_id}, status: {code}, timestamp={location.timestamp.isoformat()}"
             )
             return True
         else:
             logging.warning(
-                f"Push failed for {device_id}, status: {code}, report_id={location.hashed_adv_key_b64}"
+                f"Push failed for {device_id}, status: {code}, timestamp={location.timestamp.isoformat()}"
             )
             return False
     except Exception:
@@ -106,7 +107,6 @@ async def main_sync():
 
     # Step 1: log into an Apple account
     acc = await get_account_async()
-    print(f"Logged in as: {acc.account_name} ({acc.first_name} {acc.last_name})")
 
     # step 2: fetch reports!
     locations = await acc.fetch_location_history(airtag)
@@ -151,71 +151,3 @@ def main():
         raise RuntimeError("Push service URL not configured")
 
     return asyncio.run(main_sync())
-
-
-# from __future__ import annotations
-
-# import asyncio
-# import logging
-
-# from findmy import (
-#     FindMyAccessory,
-#     KeyPair,
-#     NearbyOfflineFindingDevice,
-#     OfflineFindingScanner,
-#     SeparatedOfflineFindingDevice,
-# )
-
-# logging.basicConfig(level=logging.INFO)
-
-
-# def _print_nearby(device: NearbyOfflineFindingDevice) -> None:
-#     print(f"NEARBY Device - {device.mac_address}")
-#     print(f"  Status byte:  {device.status:x}")
-#     print("  Extra data:")
-#     for k, v in sorted(device.additional_data.items()):
-#         print(f"    {k:20}: {v}")
-#     print()
-
-
-# def _print_separated(device: SeparatedOfflineFindingDevice) -> None:
-#     print(f"SEPARATED Device - {device.mac_address}")
-#     print(f"  Public key:   {device.adv_key_b64}")
-#     print(f"  Lookup key:   {device.hashed_adv_key_b64}")
-#     print(f"  Status byte:  {device.status:x}")
-#     print(f"  Hint byte:    {device.hint:x}")
-#     print("  Extra data:")
-#     for k, v in sorted(device.additional_data.items()):
-#         print(f"    {k:20}: {v}")
-#     print()
-
-
-# async def scan(check_key: KeyPair | FindMyAccessory | None = None) -> bool:
-#     scanner = await OfflineFindingScanner.create()
-
-#     print("Scanning for FindMy-devices...\n")
-
-#     scan_device = None
-
-#     async for device in scanner.scan_for(10, extend_timeout=True):
-#         if check_key and device.is_from(check_key):
-#             scan_device = device
-
-#     print()
-#     if scan_device:
-#         print("Found matching device!\n")
-#         if isinstance(scan_device, NearbyOfflineFindingDevice):
-#             _print_nearby(scan_device)
-#         elif isinstance(scan_device, SeparatedOfflineFindingDevice):
-#             _print_separated(scan_device)
-
-#     return scan_device is not None and check_key is not None
-
-
-# def main():
-#     dev = FindMyAccessory.from_json("airtag.json")
-#     asyncio.run(scan(dev))
-
-#     print("Current scan results were used to align the accessory.")
-#     print('Updated alignment will be saved to "airtag.json".')
-#     dev.to_json("airtag.json")

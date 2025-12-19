@@ -105,14 +105,13 @@ async def main_sync():
 
     # Step 0: create an accessory key generator
     airtag = FindMyAccessory.from_json(airtag_path)
+    alignment_dt = airtag._alignment_date  # pyright: ignore[reportPrivateUsage]
 
     # Step 1: log into an Apple account
     acc = await get_account_async()
 
     # step 2: fetch reports!
     locations = await acc.fetch_location_history(airtag)
-
-    alignment_dt = airtag._alignment_date  # pyright: ignore[reportPrivateUsage]
 
     def _ensure_aware(dt: datetime) -> datetime:
         return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
@@ -142,7 +141,7 @@ async def main_sync():
     device_name = airtag.name
     uploaded = 0
     tried = 0
-    for loc in locations or []:
+    for loc in locations:
         tried += 1
         try:
             if _upload_location(device_id, loc):

@@ -22,7 +22,7 @@ from findmy import (  # pyright: ignore[reportMissingTypeStubs]
 )
 
 STORE_PATH = "account.json"
-push_url: str | None
+push_url: str
 
 # Exponential backoff settings (per-device, in seconds)
 BASE_INTERVAL_SECONDS = 60.0  # 1 minute base interval
@@ -72,11 +72,10 @@ def ensure_aware(dt: datetime) -> datetime:
 async def upload_location(
     http_client: httpx.AsyncClient, device_id: str, location: LocationReport
 ) -> bool:
-    if not push_url:
-        raise RuntimeError("Push service URL not configured")
-
     if location.confidence > 0:
-        logging.info(f"Found non-zero confidence {location.confidence} for device {device_id} at {location.timestamp.isoformat()}")
+        logging.info(
+            f"Found non-zero confidence {location.confidence} for device {device_id} at {location.timestamp.isoformat()}"
+        )
 
     data: dict[str, Any] = {
         "id": device_id,
@@ -271,10 +270,11 @@ def main():
     )
 
     args = parser.parse_args()
+    if not args.push_url:
+        parser.error("Push URL must be specified via --push-url or PUSH_URL env var")
+
     global push_url
     push_url = args.push_url
-    if not push_url:
-        parser.error("Push URL must be specified via --push-url or PUSH_URL env var")
 
     logging.basicConfig(level=logging.INFO)
     logging.getLogger("httpx").setLevel(logging.WARNING)

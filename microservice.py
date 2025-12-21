@@ -279,11 +279,14 @@ def main():
     args = parser.parse_args()
     global push_url
     push_url = args.push_url
-
     if not push_url:
-        raise RuntimeError("Push service URL not configured")
+        parser.error("Push URL must be specified via --push-url or PUSH_URL env var")
 
     logging.basicConfig(level=logging.INFO)
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
     return asyncio.run(main_sync())
+
+
+if __name__ == "__main__":
+    main()

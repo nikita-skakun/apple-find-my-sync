@@ -1,0 +1,3 @@
+[submodule "findmy"]
+	path = findmy
+	url = git@github.com:nikita-skakun/FindMy.py.git

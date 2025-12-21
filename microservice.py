@@ -7,6 +7,7 @@ import os
 import json
 import httpx
 import time
+import random
 from typing import Any, cast
 from datetime import datetime, timezone
 
@@ -20,6 +21,7 @@ from findmy import (  # pyright: ignore[reportMissingTypeStubs]
     SmsSecondFactorMethod,
     TrustedDeviceSecondFactorMethod,
 )
+from findmy.errors import EmptyResponseError  # pyright: ignore[reportMissingTypeStubs]
 
 STORE_PATH = "account.json"
 push_url: str
@@ -122,6 +124,7 @@ async def main_sync():
     accessories_by_id: dict[str, FindMyAccessory] = {}
     pre_alignment: dict[str, datetime] = {}
     backoff_state: dict[str, dict[str, float | int]] = {}
+    network_backoff_exp = 0
 
     for a in accessories:
         device_id = a.identifier
@@ -162,10 +165,30 @@ async def main_sync():
 
                 try:
                     locations = await acc.fetch_location_history(due_accessories)
-                except Exception:
+                    network_backoff_exp = 0
+                except Exception as exc:
                     logging.exception(
                         "Failed to fetch location history for due devices"
                     )
+                    # Treat EmptyResponseError (Apple-side bug), OSError, and timeouts as transient
+                    # network-level failures and apply a global exponential backoff.
+                    if isinstance(
+                        exc, (EmptyResponseError, OSError, asyncio.TimeoutError)
+                    ):
+                        network_backoff_exp = min(
+                            MAX_BACKOFF_EXPONENT, network_backoff_exp + 1
+                        )
+                        delay = BASE_INTERVAL_SECONDS * (
+                            2**network_backoff_exp
+                        ) + random.uniform(0, 5)
+                        logging.info(
+                            "Network fetch failed; global backoff exp=%d next in %.0fs",
+                            network_backoff_exp,
+                            delay,
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+                    # Non-network errors: apply per-device backoff
                     for did in due_ids:
                         st = backoff_state[did]
                         st["exp"] = min(MAX_BACKOFF_EXPONENT, st["exp"] + 1)

@@ -32,11 +32,11 @@ async def _login_async(account: AsyncAppleAccount) -> None:
     email = input("email?  > ")
     password = input("passwd? > ")
 
-    state = cast(LoginState, await account.login(email, password)) # pyright: ignore[reportUnknownMemberType]
+    state = cast(LoginState, await account.login(email, password))  # pyright: ignore[reportUnknownMemberType]
 
     if state == LoginState.REQUIRE_2FA:  # Account requires 2FA
         # This only supports SMS methods for now
-        methods = cast(Sequence[Any], await account.get_2fa_methods()) # pyright: ignore[reportUnknownMemberType]
+        methods = cast(Sequence[Any], await account.get_2fa_methods())  # pyright: ignore[reportUnknownMemberType]
 
         # Print the (masked) phone numbers
         for i, method in enumerate(methods):
@@ -87,20 +87,10 @@ def _upload_location(device_id: str, location: LocationReport) -> bool:
     try:
         resp = _http_client.post(push_url, data=data, timeout=10.0)
         code = getattr(resp, "status_code", None)
-        if code and 200 <= code < 300:
-            logging.info(
-                f"Push succeeded for {device_id}, status: {code}, timestamp={location.timestamp.isoformat()}"
-            )
-            return True
-        else:
-            logging.warning(
-                f"Push failed for {device_id}, status: {code}, timestamp={location.timestamp.isoformat()}"
-            )
-            return False
+        return isinstance(code, int) and 200 <= code < 300
     except Exception:
         logging.exception(f"Error pushing location for {device_id}")
         exit()
-        return False
 
 
 async def main_sync():
@@ -114,10 +104,14 @@ async def main_sync():
         raise RuntimeError(f"Accessory file not found: {airtag_path}")
 
     if not isinstance(raw, list):
-        raise RuntimeError("Invalid format in airtag.json; expected a list of accessory mappings")
+        raise RuntimeError(
+            "Invalid format in airtag.json; expected a list of accessory mappings"
+        )
 
     raw_list = cast(list[FindMyAccessoryMapping], raw)
-    accessories: list[FindMyAccessory] = [FindMyAccessory.from_json(item) for item in raw_list]
+    accessories: list[FindMyAccessory] = [
+        FindMyAccessory.from_json(item) for item in raw_list
+    ]
 
     # Step 1: log into an Apple account
     acc = await get_account_async()
@@ -125,9 +119,6 @@ async def main_sync():
     def _ensure_aware(dt: datetime) -> datetime:
         return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
 
-    # Capture the alignment time for each tracker BEFORE fetching location history.
-    # The fetch may update `FindMyAccessory._alignment_date`, which would make
-    # newly-fetched reports appear older than the (updated) alignment and be rejected.
     pre_alignment: dict[FindMyAccessory, datetime] = {
         a: _ensure_aware(a._alignment_date)  # pyright: ignore[reportPrivateUsage]
         for a in accessories
@@ -152,9 +143,7 @@ async def main_sync():
 
     for airtag in accessories:
         reports = _reports_for(airtag)
-        # Use the pre-fetched alignment datetime captured before the fetch
         alignment_dt = pre_alignment[airtag]
-        before_count = len(reports)
         filtered: list[LocationReport] = []
         for loc in reports:
             try:
@@ -162,13 +151,10 @@ async def main_sync():
                 if loc_ts > alignment_dt:
                     filtered.append(loc)
             except Exception:
-                logging.exception("Error while comparing location timestamp; keeping location")
+                logging.exception(
+                    "Error while comparing location timestamp; keeping location"
+                )
                 filtered.append(loc)
-        skipped = before_count - len(filtered)
-        if skipped:
-            logging.info(
-                f"Skipping {skipped} location(s) older than alignment_date={alignment_dt.isoformat()} for {airtag.name or airtag.identifier}"
-            )
 
         device_id = airtag.identifier
         if not device_id:
@@ -213,5 +199,7 @@ def main():
 
     if not push_url:
         raise RuntimeError("Push service URL not configured")
+    
+    logging.getLogger('httpx').setLevel(logging.WARNING)
 
     return asyncio.run(main_sync())

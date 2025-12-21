@@ -26,9 +26,7 @@ push_url: str | None
 
 # Exponential backoff settings (per-device, in seconds)
 BASE_INTERVAL_SECONDS = 60.0  # 1 minute base interval
-MAX_BACKOFF_EXPONENT = (
-    5  # max exponent (effective multiplier = 2**MAX_BACKOFF_EXPONENT)
-)
+MAX_BACKOFF_EXPONENT = 5  # up to 32 minutes
 
 
 async def _login_async(account: AsyncAppleAccount) -> None:
@@ -76,6 +74,9 @@ async def upload_location(
 ) -> bool:
     if not push_url:
         raise RuntimeError("Push service URL not configured")
+
+    if location.confidence > 0:
+        logging.info(f"Found non-zero confidence {location.confidence} for device {device_id} at {location.timestamp.isoformat()}")
 
     data: dict[str, Any] = {
         "id": device_id,
@@ -142,20 +143,6 @@ async def main_sync():
         await acc.close()
         return
 
-    def get_reports_for(
-        acc_obj: FindMyAccessory, locations_map: dict[Any, list[LocationReport]]
-    ) -> list[LocationReport]:
-        reports = locations_map.get(acc_obj)
-        if reports is not None:
-            return reports
-        aid = acc_obj.identifier
-        if aid is not None:
-            for k, v in locations_map.items():
-                kid = getattr(k, "identifier", None)
-                if kid == aid or k == acc_obj:
-                    return v
-        return []
-
     try:
         async with httpx.AsyncClient(http2=True, timeout=10.0) as http_client:
             while True:
@@ -192,13 +179,20 @@ async def main_sync():
                         )
                     continue
 
+                locations_by_id: dict[str, list[LocationReport]] = {}
+                for k, v in locations.items():
+                    if isinstance(k, FindMyAccessory):
+                        kid = k.identifier
+                        if kid is not None:
+                            locations_by_id[kid] = v
+
                 for did in due_ids:
                     a = accessories_by_id.get(did)
                     if a is None:
                         backoff_state.pop(did, None)
                         continue
 
-                    reports = get_reports_for(a, locations)
+                    reports = locations_by_id.get(did, [])
                     alignment_dt = pre_alignment.get(
                         did, datetime.fromtimestamp(0, tz=timezone.utc)
                     )

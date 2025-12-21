@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import Sequence
 import logging
 import os
+import json
 import httpx
 from typing import Any, cast
 from datetime import datetime, timezone
@@ -17,6 +18,8 @@ from findmy import (  # pyright: ignore[reportMissingTypeStubs]
     SmsSecondFactorMethod,
     TrustedDeviceSecondFactorMethod,
 )
+
+from findmy.accessory import FindMyAccessoryMapping  # pyright: ignore[reportMissingTypeStubs]
 
 STORE_PATH = "account.json"
 _http_client: httpx.Client = httpx.Client(http2=True, timeout=10.0)
@@ -103,58 +106,95 @@ def _upload_location(device_id: str, location: LocationReport) -> bool:
 async def main_sync():
     airtag_path = "airtag.json"
 
-    # Step 0: create an accessory key generator
-    airtag = FindMyAccessory.from_json(airtag_path)
-    alignment_dt = airtag._alignment_date  # pyright: ignore[reportPrivateUsage]
+    # Step 0: load list of accessories
+    try:
+        with open(airtag_path, "r") as f:
+            raw = json.load(f)
+    except FileNotFoundError:
+        raise RuntimeError(f"Accessory file not found: {airtag_path}")
+
+    if not isinstance(raw, list):
+        raise RuntimeError("Invalid format in airtag.json; expected a list of accessory mappings")
+
+    raw_list = cast(list[FindMyAccessoryMapping], raw)
+    accessories: list[FindMyAccessory] = [FindMyAccessory.from_json(item) for item in raw_list]
 
     # Step 1: log into an Apple account
     acc = await get_account_async()
 
-    # step 2: fetch reports!
-    locations = await acc.fetch_location_history(airtag)
-
     def _ensure_aware(dt: datetime) -> datetime:
         return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
 
-    alignment_dt = _ensure_aware(alignment_dt)
-    before_count = len(locations)
-    filtered: list[LocationReport] = []
-    for loc in locations:
-        try:
-            loc_ts = _ensure_aware(loc.timestamp)
-            if loc_ts > alignment_dt:
-                filtered.append(loc)
-        except Exception:
-            # If anything goes wrong comparing timestamps, keep the location
-            logging.exception("Error while comparing location timestamp; keeping location")
-            filtered.append(loc)
-    skipped = before_count - len(filtered)
-    if skipped:
-        logging.info(
-            f"Skipping {skipped} location(s) older than alignment_date={alignment_dt.isoformat()}"
-        )
-    locations = filtered
+    # Capture the alignment time for each tracker BEFORE fetching location history.
+    # The fetch may update `FindMyAccessory._alignment_date`, which would make
+    # newly-fetched reports appear older than the (updated) alignment and be rejected.
+    pre_alignment: dict[FindMyAccessory, datetime] = {
+        a: _ensure_aware(a._alignment_date)  # pyright: ignore[reportPrivateUsage]
+        for a in accessories
+    }
 
-    device_id = airtag.identifier
-    if not device_id:
-        raise RuntimeError("Accessory has no identifier set")
-    device_name = airtag.name
-    uploaded = 0
-    tried = 0
-    for loc in locations:
-        tried += 1
-        try:
-            if _upload_location(device_id, loc):
-                uploaded += 1
-        except Exception:
-            logging.exception("Error while uploading a location")
-    logging.info(
-        f"Device ID: {device_id} | Name: {device_name} | Uploaded: {uploaded}/{tried} locations"
-    )
+    # step 2: fetch reports for all accessories
+    try:
+        locations = await acc.fetch_location_history(accessories)
+    except Exception:
+        logging.exception("Failed to fetch location history")
+        locations = {}
+
+    # Helper to get reports for a specific accessory, being lenient with keys
+    def _reports_for(acc_obj: FindMyAccessory) -> list[LocationReport]:
+        reports = locations.get(acc_obj)
+        if reports is not None:
+            return reports
+        for k, v in locations.items():
+            if k == acc_obj:
+                return v
+        return []
+
+    for airtag in accessories:
+        reports = _reports_for(airtag)
+        # Use the pre-fetched alignment datetime captured before the fetch
+        alignment_dt = pre_alignment[airtag]
+        before_count = len(reports)
+        filtered: list[LocationReport] = []
+        for loc in reports:
+            try:
+                loc_ts = _ensure_aware(loc.timestamp)
+                if loc_ts > alignment_dt:
+                    filtered.append(loc)
+            except Exception:
+                logging.exception("Error while comparing location timestamp; keeping location")
+                filtered.append(loc)
+        skipped = before_count - len(filtered)
+        if skipped:
+            logging.info(
+                f"Skipping {skipped} location(s) older than alignment_date={alignment_dt.isoformat()} for {airtag.name or airtag.identifier}"
+            )
+
+        device_id = airtag.identifier
+        if not device_id:
+            logging.warning("Accessory has no identifier set; skipping")
+            continue
+        device_name = airtag.name
+        uploaded = 0
+        tried = 0
+        for loc in filtered:
+            tried += 1
+            try:
+                if _upload_location(device_id, loc):
+                    uploaded += 1
+            except Exception:
+                logging.exception("Error while uploading a location")
+        logging.info(
+            f"Device ID: {device_id} | Name: {device_name} | Uploaded: {uploaded}/{tried} locations"
+        )
 
     await acc.close()
     acc.to_json(STORE_PATH)
-    airtag.to_json(airtag_path)
+
+    # Save accessories back as a list
+    out = [a.to_json(None) for a in accessories]
+    with open(airtag_path, "w") as f:
+        json.dump(out, f, indent=4)
 
 
 def main():

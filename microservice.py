@@ -25,6 +25,12 @@ STORE_PATH = "account.json"
 _http_client: httpx.Client = httpx.Client(http2=True, timeout=10.0)
 push_url: str | None
 
+# Exponential backoff settings (per-device, in seconds)
+BASE_INTERVAL_SECONDS = 60.0  # 1 minute base interval
+MAX_BACKOFF_EXPONENT = (
+    5  # max exponent (effective multiplier = 2**MAX_BACKOFF_EXPONENT)
+)
+
 logging.basicConfig(level=logging.INFO)
 
 
@@ -90,7 +96,12 @@ def _upload_location(device_id: str, location: LocationReport) -> bool:
         return isinstance(code, int) and 200 <= code < 300
     except Exception:
         logging.exception(f"Error pushing location for {device_id}")
-        exit()
+        return False
+
+
+async def _upload_location_async(device_id: str, location: LocationReport) -> bool:
+    # Run the blocking HTTP upload in a thread so we don't block the event loop.
+    return await asyncio.to_thread(_upload_location, device_id, location)
 
 
 async def main_sync():
@@ -124,63 +135,140 @@ async def main_sync():
         for a in accessories
     }
 
-    # step 2: fetch reports for all accessories
-    try:
-        locations = await acc.fetch_location_history(accessories)
-    except Exception:
-        logging.exception("Failed to fetch location history")
-        locations = {}
+    loop = asyncio.get_running_loop()
+    now = loop.time()
+    backoff_state: dict[FindMyAccessory, dict[str, float | int]] = {
+        a: {"exp": 0, "next_run": now} for a in accessories
+    }
 
-    # Helper to get reports for a specific accessory, being lenient with keys
-    def _reports_for(acc_obj: FindMyAccessory) -> list[LocationReport]:
-        reports = locations.get(acc_obj)
+    def _reports_for(
+        acc_obj: FindMyAccessory, locations_map: dict[Any, list[LocationReport]]
+    ) -> list[LocationReport]:
+        reports = locations_map.get(acc_obj)
         if reports is not None:
             return reports
-        for k, v in locations.items():
+        for k, v in locations_map.items():
             if k == acc_obj:
                 return v
         return []
 
-    for airtag in accessories:
-        reports = _reports_for(airtag)
-        alignment_dt = pre_alignment[airtag]
-        filtered: list[LocationReport] = []
-        for loc in reports:
+    try:
+        while True:
+            now = loop.time()
+            # pick accessories whose schedule is due
+            due = [a for a, s in backoff_state.items() if s["next_run"] <= now]
+            if not due:
+                # sleep until the next scheduled device
+                next_run = min(s["next_run"] for s in backoff_state.values())
+                sleep_for = max(0, next_run - now)
+                await asyncio.sleep(sleep_for)
+                continue
+
             try:
-                loc_ts = _ensure_aware(loc.timestamp)
-                if loc_ts > alignment_dt:
-                    filtered.append(loc)
+                locations = await acc.fetch_location_history(due)
             except Exception:
-                logging.exception(
-                    "Error while comparing location timestamp; keeping location"
+                logging.exception("Failed to fetch location history for due devices")
+                # on fetch failure, increase backoff for the affected devices
+                for a in due:
+                    st = backoff_state[a]
+                    st["exp"] = min(MAX_BACKOFF_EXPONENT, st["exp"] + 1)
+                    st["next_run"] = now + BASE_INTERVAL_SECONDS * (2 ** st["exp"])
+                    logging.info(
+                        "Device %s fetch failed; backoff exp=%d next in %.0fs",
+                        a.identifier or "<unknown>",
+                        st["exp"],
+                        st["next_run"] - now,
+                    )
+                continue
+
+            # process each device individually
+            for a in due:
+                reports = _reports_for(a, locations)
+                alignment_dt = pre_alignment.get(
+                    a, datetime.fromtimestamp(0, tz=timezone.utc)
                 )
-                filtered.append(loc)
+                filtered: list[LocationReport] = []
+                for loc in reports:
+                    try:
+                        loc_ts = _ensure_aware(loc.timestamp)
+                        if loc_ts > alignment_dt:
+                            filtered.append(loc)
+                    except Exception:
+                        logging.exception(
+                            "Error while comparing location timestamp; keeping location"
+                        )
+                        filtered.append(loc)
 
-        device_id = airtag.identifier
-        if not device_id:
-            logging.warning("Accessory has no identifier set; skipping")
-            continue
-        device_name = airtag.name
-        uploaded = 0
-        tried = 0
-        for loc in filtered:
-            tried += 1
-            try:
-                if _upload_location(device_id, loc):
-                    uploaded += 1
-            except Exception:
-                logging.exception("Error while uploading a location")
-        logging.info(
-            f"Device ID: {device_id} | Name: {device_name} | Uploaded: {uploaded}/{tried} locations"
-        )
+                device_id = a.identifier
+                if not device_id:
+                    logging.warning("Accessory has no identifier set; skipping")
+                    backoff_state.pop(a, None)
+                    continue
 
-    await acc.close()
-    acc.to_json(STORE_PATH)
+                device_name = a.name
+                uploaded = 0
+                tried = 0
 
-    # Save accessories back as a list
-    out = [a.to_json(None) for a in accessories]
-    with open(airtag_path, "w") as f:
-        json.dump(out, f, indent=4)
+                if not filtered:
+                    # no new reports: increase backoff
+                    st = backoff_state[a]
+                    st["exp"] = min(MAX_BACKOFF_EXPONENT, st["exp"] + 1)
+                    st["next_run"] = now + BASE_INTERVAL_SECONDS * (2 ** st["exp"])
+                    logging.info(
+                        "Device ID: %s | Name: %s | No new reports; backoff exp=%d next in %.0fs",
+                        device_id,
+                        device_name,
+                        st["exp"],
+                        st["next_run"] - now,
+                    )
+                else:
+                    # upload new reports in chronological order
+                    filtered.sort(key=lambda r: _ensure_aware(r.timestamp))
+                    for loc in filtered:
+                        tried += 1
+                        try:
+                            if await _upload_location_async(device_id, loc):
+                                uploaded += 1
+                        except Exception:
+                            logging.exception("Error while uploading a location")
+                    logging.info(
+                        "Device ID: %s | Name: %s | Uploaded: %d/%d locations",
+                        device_id,
+                        device_name,
+                        uploaded,
+                        tried,
+                    )
+
+                    # update alignment timestamp to the latest processed
+                    latest_ts = max(_ensure_aware(r.timestamp) for r in filtered)
+                    pre_alignment[a] = latest_ts
+                    try:
+                        a._alignment_date = latest_ts  # pyright: ignore[reportPrivateUsage]
+                    except Exception:
+                        logging.exception("Could not update accessory alignment date")
+
+                    # reset backoff to base interval
+                    st = backoff_state[a]
+                    st["exp"] = 0
+                    st["next_run"] = now + BASE_INTERVAL_SECONDS
+
+                    # persist accessory alignment immediately
+                    out = [x.to_json(None) for x in accessories]
+                    with open(airtag_path, "w") as f:
+                        json.dump(out, f, indent=4)
+
+            # small sleep to avoid tight loop
+            await asyncio.sleep(0.1)
+
+    except asyncio.CancelledError:
+        logging.info("Service loop cancelled")
+    except KeyboardInterrupt:
+        logging.info("Interrupted; shutting down")
+    finally:
+        # ensure account is saved on shutdown
+        await acc.close()
+        acc.to_json(STORE_PATH)
+        out = [a.to_json(None) for a in accessories]
 
 
 def main():
@@ -199,7 +287,7 @@ def main():
 
     if not push_url:
         raise RuntimeError("Push service URL not configured")
-    
-    logging.getLogger('httpx').setLevel(logging.WARNING)
+
+    logging.getLogger("httpx").setLevel(logging.WARNING)
 
     return asyncio.run(main_sync())

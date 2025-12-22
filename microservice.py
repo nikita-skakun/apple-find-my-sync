@@ -132,12 +132,7 @@ async def main_sync():
             logging.warning("Accessory %s has no identifier; skipping", a.name)
             continue
         accessories_by_id[device_id] = a
-        alignment = getattr(a, "_alignment_date", None)
-        pre_alignment[device_id] = (
-            ensure_aware(alignment)
-            if alignment is not None
-            else datetime.fromtimestamp(0, tz=timezone.utc)
-        )
+        pre_alignment[device_id] = ensure_aware(a._alignment_date)  # pyright: ignore[reportPrivateUsage]
         backoff_state[device_id] = {"exp": 0, "next_run": now}
 
     if not backoff_state:

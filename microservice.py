@@ -123,8 +123,14 @@ class LocationSyncService:
         return locations_by_id
 
     async def upload_location(self, http_client: httpx.AsyncClient, device_id: str, location: LocationReport) -> bool:
-        if location.confidence > 0:
-            logging.info(f"Found non-zero confidence {location.confidence} for device {device_id} at {location.timestamp.isoformat()}")
+        confidence_str = str(location.confidence)
+        if not all(c in '01' for c in confidence_str):
+            logging.error(f"Confidence value {location.confidence} contains non-binary digits, skipping upload")
+            return False
+        
+        confidence_int = int(confidence_str, 2)
+        if confidence_int not in (0, 1, 2, 3):
+            logging.warning(f"Parsed confidence {confidence_int} is not in 0-3 range for device {device_id} at {location.timestamp.isoformat()}")
 
         data: dict[str, Any] = {
             "id": device_id,
@@ -132,7 +138,7 @@ class LocationSyncService:
             "lat": location.latitude,
             "lon": location.longitude,
             "accuracy": location.horizontal_accuracy,
-            "confidence": location.confidence,
+            "confidence": confidence_int,
             "findmy_status": location.status,
         }
 

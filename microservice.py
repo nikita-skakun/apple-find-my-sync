@@ -46,9 +46,8 @@ class DeviceState:
 
 
 class LocationSyncService:
-    def __init__(self, push_url: str, ignore_device_ids: set[str]):
+    def __init__(self, push_url: str):
         self.push_url = push_url
-        self.ignore_device_ids = ignore_device_ids
         self.account: AsyncAppleAccount | None = None
         self.accessories: list[FindMyAccessory] = []
         self.device_states: dict[str, DeviceState] = {}
@@ -77,9 +76,6 @@ class LocationSyncService:
             device_id = a.identifier
             if not device_id:
                 logging.warning("Accessory %s has no identifier; skipping", a.name)
-                continue
-            if device_id in self.ignore_device_ids:
-                logging.debug("Ignoring device %s (%s)", device_id, a.name)
                 continue
             self.device_states[device_id] = DeviceState(ensure_aware(a._alignment_date))  # pyright: ignore[reportPrivateUsage]
             self.device_states[device_id].next_run = now
@@ -250,12 +246,6 @@ def main():
         default=os.environ.get("PUSH_URL"),
         help="URL to which locations are uploaded",
     )
-    parser.add_argument(
-        "--ignore-device-ids",
-        nargs='*',
-        default=[],
-        help="List of device IDs to ignore",
-    )
 
     args = parser.parse_args()
     if not args.push_url:
@@ -264,8 +254,7 @@ def main():
     logging.basicConfig(level=logging.INFO)
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
-    ignore_device_ids = set(args.ignore_device_ids)
-    service = LocationSyncService(args.push_url, ignore_device_ids)
+    service = LocationSyncService(args.push_url)
     return asyncio.run(service.run())
 
 

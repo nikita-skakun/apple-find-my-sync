@@ -24,11 +24,192 @@ from findmy import (  # pyright: ignore[reportMissingTypeStubs]
 from findmy.errors import EmptyResponseError  # pyright: ignore[reportMissingTypeStubs]
 
 STORE_PATH = "account.json"
-push_url: str
 
 # Exponential backoff settings (per-device, in seconds)
 BASE_INTERVAL_SECONDS = 60.0  # 1 minute base interval
 MAX_BACKOFF_EXPONENT = 5  # up to 32 minutes
+
+
+class DeviceState:
+    def __init__(self, alignment_date: datetime):
+        self.alignment_date = alignment_date
+        self.backoff_exp = 0
+        self.next_run = 0.0
+
+    def apply_backoff(self, now: float) -> None:
+        self.backoff_exp = min(MAX_BACKOFF_EXPONENT, self.backoff_exp + 1)
+        self.next_run = now + BASE_INTERVAL_SECONDS * (2 ** self.backoff_exp)
+
+    def reset_backoff(self, now: float) -> None:
+        self.backoff_exp = 0
+        self.next_run = now + BASE_INTERVAL_SECONDS
+
+
+class LocationSyncService:
+    def __init__(self, push_url: str, ignore_device_ids: set[str]):
+        self.push_url = push_url
+        self.ignore_device_ids = ignore_device_ids
+        self.account: AsyncAppleAccount | None = None
+        self.accessories: list[FindMyAccessory] = []
+        self.device_states: dict[str, DeviceState] = {}
+        self.network_backoff_exp = 0
+        self.airtag_path = "airtag.json"
+
+    async def load_accessories(self) -> None:
+        if not os.path.exists(self.airtag_path):
+            raise RuntimeError(f"Accessory file not found: {self.airtag_path}")
+
+        with open(self.airtag_path, "r") as f:
+            raw = json.load(f)
+
+        if not isinstance(raw, list):
+            raise RuntimeError(
+                "Invalid format in airtag.json; expected a list of accessory mappings"
+            )
+
+        raw_list = cast(list[FindMyAccessoryMapping], raw)
+        self.accessories = [
+            FindMyAccessory.from_json(item) for item in raw_list
+        ]
+
+        now = time.monotonic()
+        for a in self.accessories:
+            device_id = a.identifier
+            if not device_id:
+                logging.warning("Accessory %s has no identifier; skipping", a.name)
+                continue
+            if device_id in self.ignore_device_ids:
+                logging.debug("Ignoring device %s (%s)", device_id, a.name)
+                continue
+            self.device_states[device_id] = DeviceState(ensure_aware(a._alignment_date))  # pyright: ignore[reportPrivateUsage]
+            self.device_states[device_id].next_run = now
+
+        if not self.device_states:
+            raise RuntimeError("No accessories with identifiers found")
+
+    async def get_account(self) -> AsyncAppleAccount:
+        libs_path = "ani_libs.bin"
+        if os.path.exists(STORE_PATH):
+            acc = AsyncAppleAccount.from_json(STORE_PATH, anisette_libs_path=libs_path)
+        else:
+            acc = AsyncAppleAccount(LocalAnisetteProvider(libs_path=libs_path))
+            await _login_async(acc)
+            acc.to_json(STORE_PATH)
+        return acc
+
+    async def fetch_locations(self, due_accessories: list[FindMyAccessory]) -> dict[str, list[LocationReport]]:
+        try:
+            locations = await self.account.fetch_location_history(due_accessories)  # pyright: ignore[reportOptionalMemberAccess]
+            self.network_backoff_exp = 0
+        except Exception as exc:
+            logging.exception("Failed to fetch location history for due devices")
+            if isinstance(exc, (EmptyResponseError, OSError, asyncio.TimeoutError)):
+                self.network_backoff_exp = min(MAX_BACKOFF_EXPONENT, self.network_backoff_exp + 1)
+                delay = BASE_INTERVAL_SECONDS * (2 ** self.network_backoff_exp) + random.uniform(0, 5)
+                logging.info("Network fetch failed; global backoff exp=%d next in %.0fs", self.network_backoff_exp, delay)
+                await asyncio.sleep(delay)
+                return {}
+            else:
+                for a in due_accessories:
+                    did = a.identifier
+                    if did and did in self.device_states:
+                        now = time.monotonic()
+                        self.device_states[did].apply_backoff(now)
+                        logging.info("Device %s fetch failed; backoff exp=%d next in %.0fs", did, self.device_states[did].backoff_exp, self.device_states[did].next_run - now)
+                return {}
+
+        locations_by_id: dict[str, list[LocationReport]] = {}
+        for k, v in locations.items():
+            if isinstance(k, FindMyAccessory):
+                kid = k.identifier
+                if kid is not None:
+                    locations_by_id[kid] = v
+        return locations_by_id
+
+    async def upload_location(self, http_client: httpx.AsyncClient, device_id: str, location: LocationReport) -> bool:
+        if location.confidence > 0:
+            logging.info(f"Found non-zero confidence {location.confidence} for device {device_id} at {location.timestamp.isoformat()}")
+
+        data: dict[str, Any] = {
+            "id": device_id,
+            "timestamp": location.timestamp.isoformat(),
+            "lat": location.latitude,
+            "lon": location.longitude,
+            "accuracy": location.horizontal_accuracy,
+            "confidence": location.confidence,
+            "findmy_status": location.status,
+        }
+
+        try:
+            resp = await http_client.post(self.push_url, data=data, timeout=10.0)
+            return 200 <= resp.status_code < 300
+        except Exception:
+            logging.exception("Error pushing location for %s", device_id)
+            return False
+
+    async def process_locations(self, http_client: httpx.AsyncClient, locations_by_id: dict[str, list[LocationReport]]) -> None:
+        for did, state in self.device_states.items():
+            a = next((acc for acc in self.accessories if acc.identifier == did), None)
+            if a is None:
+                del self.device_states[did]
+                continue
+
+            reports = locations_by_id.get(did, [])
+            filtered: list[LocationReport] = []
+            for loc in reports:
+                try:
+                    if ensure_aware(loc.timestamp) > state.alignment_date:
+                        filtered.append(loc)  # type: ignore[reportUnknownMemberType]
+                except Exception:
+                    logging.exception("Error while comparing location timestamp; keeping location")
+                    filtered.append(loc)  # type: ignore[reportUnknownMemberType]
+
+            if not filtered:
+                now = time.monotonic()
+                state.apply_backoff(now)
+                logging.info("Device ID: %s | Name: %s | No new reports; backoff exp=%d next in %.0fs", did, a.name, state.backoff_exp, state.next_run - now)
+                continue
+
+            tasks = [self.upload_location(http_client, did, loc) for loc in filtered]  # type: ignore[reportUnknownArgument]
+            results = await asyncio.gather(*tasks)
+            uploaded = sum(results)
+            tried = len(filtered)  # type: ignore[reportUnknownArgument]
+            logging.info("Device ID: %s | Name: %s | Uploaded: %d/%d locations", did, a.name, uploaded, tried)
+
+            state.alignment_date = a._alignment_date  # pyright: ignore[reportPrivateUsage]
+            now = time.monotonic()
+            state.reset_backoff(now)
+
+        out = [x.to_json(None) for x in self.accessories]
+        with open(self.airtag_path, "w") as f:
+            json.dump(out, f, indent=4)
+
+    async def run(self) -> None:
+        await self.load_accessories()
+        self.account = await self.get_account()
+
+        try:
+            async with httpx.AsyncClient(http2=True, timeout=10.0) as http_client:
+                while True:
+                    now = time.monotonic()
+                    due_ids = [did for did, s in self.device_states.items() if s.next_run <= now]
+                    if not due_ids:
+                        next_run = min(s.next_run for s in self.device_states.values())
+                        await asyncio.sleep(max(0, next_run - now))
+                        continue
+
+                    due_accessories = [a for a in self.accessories if a.identifier in due_ids]
+                    locations_by_id = await self.fetch_locations(due_accessories)
+                    await self.process_locations(http_client, locations_by_id)
+
+        except asyncio.CancelledError:
+            logging.info("Service loop cancelled")
+        except KeyboardInterrupt:
+            logging.info("Interrupted; shutting down")
+        finally:
+            if self.account:
+                await self.account.close()
+                self.account.to_json(STORE_PATH)
 
 
 async def _login_async(account: AsyncAppleAccount) -> None:
@@ -56,225 +237,8 @@ async def _login_async(account: AsyncAppleAccount) -> None:
         await method.submit(code)
 
 
-async def get_account_async() -> AsyncAppleAccount:
-    libs_path = "ani_libs.bin"
-    if os.path.exists(STORE_PATH):
-        acc = AsyncAppleAccount.from_json(STORE_PATH, anisette_libs_path=libs_path)
-    else:
-        acc = AsyncAppleAccount(LocalAnisetteProvider(libs_path=libs_path))
-        await _login_async(acc)
-        acc.to_json(STORE_PATH)
-    return acc
-
-
 def ensure_aware(dt: datetime) -> datetime:
     return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
-
-
-async def upload_location(
-    http_client: httpx.AsyncClient, device_id: str, location: LocationReport
-) -> bool:
-    if location.confidence > 0:
-        logging.info(
-            f"Found non-zero confidence {location.confidence} for device {device_id} at {location.timestamp.isoformat()}"
-        )
-
-    data: dict[str, Any] = {
-        "id": device_id,
-        "timestamp": location.timestamp.isoformat(),
-        "lat": location.latitude,
-        "lon": location.longitude,
-        "accuracy": location.horizontal_accuracy,
-        "confidence": location.confidence,
-        "findmy_status": location.status,
-    }
-
-    try:
-        resp = await http_client.post(push_url, data=data, timeout=10.0)
-        return 200 <= resp.status_code < 300
-    except Exception:
-        logging.exception("Error pushing location for %s", device_id)
-        return False
-
-
-async def main_sync():
-    airtag_path = "airtag.json"
-
-    # Step 0: load list of accessories
-    if not os.path.exists(airtag_path):
-        raise RuntimeError(f"Accessory file not found: {airtag_path}")
-
-    with open(airtag_path, "r") as f:
-        raw = json.load(f)
-
-    if not isinstance(raw, list):
-        raise RuntimeError(
-            "Invalid format in airtag.json; expected a list of accessory mappings"
-        )
-
-    raw_list = cast(list[FindMyAccessoryMapping], raw)
-    accessories: list[FindMyAccessory] = [
-        FindMyAccessory.from_json(item) for item in raw_list
-    ]
-
-    # Step 1: log into an Apple account
-    acc = await get_account_async()
-
-    now = time.monotonic()
-    accessories_by_id: dict[str, FindMyAccessory] = {}
-    pre_alignment: dict[str, datetime] = {}
-    backoff_state: dict[str, dict[str, float | int]] = {}
-    network_backoff_exp = 0
-
-    for a in accessories:
-        device_id = a.identifier
-        if not device_id:
-            logging.warning("Accessory %s has no identifier; skipping", a.name)
-            continue
-        accessories_by_id[device_id] = a
-        pre_alignment[device_id] = ensure_aware(a._alignment_date)  # pyright: ignore[reportPrivateUsage]
-        backoff_state[device_id] = {"exp": 0, "next_run": now}
-
-    if not backoff_state:
-        logging.warning("No accessories with identifiers found; exiting")
-        await acc.close()
-        return
-
-    try:
-        async with httpx.AsyncClient(http2=True, timeout=10.0) as http_client:
-            while True:
-                now = time.monotonic()
-                due_ids = [
-                    did for did, s in backoff_state.items() if s["next_run"] <= now
-                ]
-                if not due_ids:
-                    next_run = min(s["next_run"] for s in backoff_state.values())
-                    await asyncio.sleep(max(0, next_run - now))
-                    continue
-
-                due_accessories = [
-                    accessories_by_id[did]
-                    for did in due_ids
-                    if did in accessories_by_id
-                ]
-
-                try:
-                    locations = await acc.fetch_location_history(due_accessories)
-                    network_backoff_exp = 0
-                except Exception as exc:
-                    logging.exception(
-                        "Failed to fetch location history for due devices"
-                    )
-                    # Treat EmptyResponseError (Apple-side bug), OSError, and timeouts as transient
-                    # network-level failures and apply a global exponential backoff.
-                    if isinstance(
-                        exc, (EmptyResponseError, OSError, asyncio.TimeoutError)
-                    ):
-                        network_backoff_exp = min(
-                            MAX_BACKOFF_EXPONENT, network_backoff_exp + 1
-                        )
-                        delay = BASE_INTERVAL_SECONDS * (
-                            2**network_backoff_exp
-                        ) + random.uniform(0, 5)
-                        logging.info(
-                            "Network fetch failed; global backoff exp=%d next in %.0fs",
-                            network_backoff_exp,
-                            delay,
-                        )
-                        await asyncio.sleep(delay)
-                        continue
-                    # Non-network errors: apply per-device backoff
-                    for did in due_ids:
-                        st = backoff_state[did]
-                        st["exp"] = min(MAX_BACKOFF_EXPONENT, st["exp"] + 1)
-                        st["next_run"] = now + BASE_INTERVAL_SECONDS * (2 ** st["exp"])
-                        logging.info(
-                            "Device %s fetch failed; backoff exp=%d next in %.0fs",
-                            did,
-                            st["exp"],
-                            st["next_run"] - now,
-                        )
-                    continue
-
-                locations_by_id: dict[str, list[LocationReport]] = {}
-                for k, v in locations.items():
-                    if isinstance(k, FindMyAccessory):
-                        kid = k.identifier
-                        if kid is not None:
-                            locations_by_id[kid] = v
-
-                for did in due_ids:
-                    a = accessories_by_id.get(did)
-                    if a is None:
-                        backoff_state.pop(did, None)
-                        continue
-
-                    reports = locations_by_id.get(did, [])
-                    alignment_dt = pre_alignment.get(
-                        did, datetime.fromtimestamp(0, tz=timezone.utc)
-                    )
-                    filtered: list[LocationReport] = []
-                    for loc in reports:
-                        try:
-                            loc_ts = ensure_aware(loc.timestamp)
-                            if loc_ts > alignment_dt:
-                                filtered.append(loc)
-                        except Exception:
-                            logging.exception(
-                                "Error while comparing location timestamp; keeping location"
-                            )
-                            filtered.append(loc)
-
-                    if not filtered:
-                        st = backoff_state[did]
-                        st["exp"] = min(MAX_BACKOFF_EXPONENT, st["exp"] + 1)
-                        st["next_run"] = now + BASE_INTERVAL_SECONDS * (2 ** st["exp"])
-                        logging.info(
-                            "Device ID: %s | Name: %s | No new reports; backoff exp=%d next in %.0fs",
-                            did,
-                            a.name,
-                            st["exp"],
-                            st["next_run"] - now,
-                        )
-                        continue
-
-                    # upload in chronological order
-                    filtered.sort(key=lambda r: ensure_aware(r.timestamp))
-                    uploaded = 0
-                    tried = 0
-                    for loc in filtered:
-                        tried += 1
-                        try:
-                            if await upload_location(http_client, did, loc):
-                                uploaded += 1
-                        except Exception:
-                            logging.exception("Error while uploading a location")
-                    logging.info(
-                        "Device ID: %s | Name: %s | Uploaded: %d/%d locations",
-                        did,
-                        a.name,
-                        uploaded,
-                        tried,
-                    )
-
-                    pre_alignment[did] = a._alignment_date  # pyright: ignore[reportPrivateUsage]
-                    st = backoff_state[did]
-                    st["exp"] = 0
-                    st["next_run"] = now + BASE_INTERVAL_SECONDS
-
-                    out = [x.to_json(None) for x in accessories]
-                    with open(airtag_path, "w") as f:
-                        json.dump(out, f, indent=4)
-
-                await asyncio.sleep(1)
-
-    except asyncio.CancelledError:
-        logging.info("Service loop cancelled")
-    except KeyboardInterrupt:
-        logging.info("Interrupted; shutting down")
-    finally:
-        await acc.close()
-        acc.to_json(STORE_PATH)
 
 
 def main():
@@ -286,18 +250,23 @@ def main():
         default=os.environ.get("PUSH_URL"),
         help="URL to which locations are uploaded",
     )
+    parser.add_argument(
+        "--ignore-device-ids",
+        nargs='*',
+        default=[],
+        help="List of device IDs to ignore",
+    )
 
     args = parser.parse_args()
     if not args.push_url:
         parser.error("Push URL must be specified via --push-url or PUSH_URL env var")
 
-    global push_url
-    push_url = args.push_url
-
     logging.basicConfig(level=logging.INFO)
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
-    return asyncio.run(main_sync())
+    ignore_device_ids = set(args.ignore_device_ids)
+    service = LocationSyncService(args.push_url, ignore_device_ids)
+    return asyncio.run(service.run())
 
 
 if __name__ == "__main__":

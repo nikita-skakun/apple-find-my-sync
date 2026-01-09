@@ -4,7 +4,7 @@ version = "0.1.0"
 requires-python = ">=3.13"
 description = "A set of tools to interact with the Apple Find My network."
 dependencies = [
-	"findmy>=0.9.7",
+	"findmy>=0.9.8",
 	"httpx[http2]>=0.28.1",
 	"setuptools>=80.9.0",
 ]

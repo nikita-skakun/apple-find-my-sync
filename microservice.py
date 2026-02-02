@@ -102,19 +102,20 @@ class LocationSyncService:
             locations = await self.account.fetch_location_history(due_accessories)  # pyright: ignore[reportOptionalMemberAccess]
             self.network_fib_index = 0
         except Exception as exc:
-            logging.exception("Failed to fetch location history for due devices")
             if isinstance(exc, (EmptyResponseError, OSError, asyncio.TimeoutError)):
                 self.network_fib_index = min(MAX_FIB_INDEX, self.network_fib_index + 1)
                 delay = BASE_INTERVAL_SECONDS * FIBONACCI_SEQUENCE[
                     self.network_fib_index
                 ] + random.uniform(0, 5)
                 logging.info(
-                    "Network fetch failed; next retry in %.0fs",
+                    "Network fetch failed (%s); next retry in %.0fs",
+                    exc.__class__.__name__,
                     delay,
                 )
                 await asyncio.sleep(delay)
                 return {}
             else:
+                logging.exception("Failed to fetch location history for due devices")
                 for a in due_accessories:
                     did = a.identifier
                     if did and did in self.device_states:
@@ -172,33 +173,54 @@ class LocationSyncService:
         self,
         http_client: httpx.AsyncClient,
         locations_by_id: dict[str, list[LocationReport]],
+        due_ids: list[str],
     ) -> None:
         devices_to_remove: list[str] = []
-        for did, state in self.device_states.items():
+        for did in due_ids:
+            state = self.device_states.get(did)
+            if state is None:
+                continue
             a = self.accessory_by_id.get(did)
             if a is None:
                 devices_to_remove.append(did)
                 continue
 
             reports = locations_by_id.get(did, [])
+            if not reports:
+                now = time.monotonic()
+                state.apply_backoff(now)
+                logging.info(
+                    "Device ID: %s | Name: %s | No reports in response; next in %.0fs",
+                    did,
+                    a.name,
+                    state.next_run - now,
+                )
+                continue
+
             filtered: list[LocationReport] = []
             for loc in reports:
                 try:
-                    if ensure_aware(loc.timestamp) > state.alignment_date:
-                        filtered.append(loc)  # type: ignore[reportUnknownMemberType]
+                    loc_aware = ensure_aware(loc.timestamp)
+                    if loc_aware > state.alignment_date:
+                        filtered.append(loc)
                 except Exception:
                     logging.exception(
                         "Error while comparing location timestamp; keeping location"
                     )
-                    filtered.append(loc)  # type: ignore[reportUnknownMemberType]
+                    filtered.append(loc)
 
             if not filtered:
                 now = time.monotonic()
                 state.apply_backoff(now)
+                latest_ts = max(
+                    (ensure_aware(loc.timestamp) for loc in reports), default=None
+                )
                 logging.info(
-                    "Device ID: %s | Name: %s | No new reports; next in %.0fs",
+                    "Device ID: %s | Name: %s | Alignment: %s | Latest report: %s | No new reports; next in %.0fs",
                     did,
                     a.name,
+                    state.alignment_date.isoformat(),
+                    latest_ts.isoformat() if latest_ts else "None",
                     state.next_run - now,
                 )
                 continue
@@ -248,7 +270,7 @@ class LocationSyncService:
                         a for a in self.accessories if a.identifier in due_ids
                     ]
                     locations_by_id = await self.fetch_locations(due_accessories)
-                    await self.process_locations(http_client, locations_by_id)
+                    await self.process_locations(http_client, locations_by_id, due_ids)
 
         except asyncio.CancelledError:
             logging.info("Service loop cancelled")

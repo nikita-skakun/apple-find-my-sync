@@ -23,26 +23,26 @@ from findmy import (  # pyright: ignore[reportMissingTypeStubs]
 )
 from findmy.errors import EmptyResponseError  # pyright: ignore[reportMissingTypeStubs]
 
-STORE_PATH = "account.json"
+FIBONACCI_SEQUENCE = [1, 1, 2, 3, 5, 8, 13, 21, 34]
+MAX_FIB_INDEX = len(FIBONACCI_SEQUENCE) - 1
+BASE_INTERVAL_SECONDS = 60.0
 
-# Exponential backoff settings (per-device, in seconds)
-BASE_INTERVAL_SECONDS = 60.0  # 1 minute base interval
-MAX_BACKOFF_EXPONENT = 5  # up to 32 minutes
+STORE_PATH = "account.json"
 
 
 class DeviceState:
     def __init__(self, alignment_date: datetime):
         self.alignment_date = alignment_date
-        self.backoff_exp = 0
+        self.fib_index = 0
         self.next_run = 0.0
 
     def apply_backoff(self, now: float) -> None:
-        self.backoff_exp = min(MAX_BACKOFF_EXPONENT, self.backoff_exp + 1)
-        self.next_run = now + BASE_INTERVAL_SECONDS * (2 ** self.backoff_exp)
+        self.fib_index = min(MAX_FIB_INDEX, self.fib_index + 1)
+        self.next_run = now + BASE_INTERVAL_SECONDS * FIBONACCI_SEQUENCE[self.fib_index]
 
     def reset_backoff(self, now: float) -> None:
-        self.backoff_exp = 0
-        self.next_run = now + BASE_INTERVAL_SECONDS
+        self.fib_index = 0
+        self.next_run = now + BASE_INTERVAL_SECONDS * FIBONACCI_SEQUENCE[0]
 
 
 class LocationSyncService:
@@ -50,8 +50,9 @@ class LocationSyncService:
         self.push_url = push_url
         self.account: AsyncAppleAccount | None = None
         self.accessories: list[FindMyAccessory] = []
+        self.accessory_by_id: dict[str, FindMyAccessory] = {}
         self.device_states: dict[str, DeviceState] = {}
-        self.network_backoff_exp = 0
+        self.network_fib_index = 0
         self.airtag_path = "airtag.json"
 
     async def load_accessories(self) -> None:
@@ -67,18 +68,19 @@ class LocationSyncService:
             )
 
         raw_list = cast(list[FindMyAccessoryMapping], raw)
-        self.accessories = [
-            FindMyAccessory.from_json(item) for item in raw_list
-        ]
+        self.accessories = [FindMyAccessory.from_json(item) for item in raw_list]
+        self.accessory_by_id = {
+            a.identifier: a for a in self.accessories if a.identifier
+        }
 
         now = time.monotonic()
-        for a in self.accessories:
+        for i, a in enumerate(self.accessories):
             device_id = a.identifier
             if not device_id:
                 logging.warning("Accessory %s has no identifier; skipping", a.name)
                 continue
             self.device_states[device_id] = DeviceState(ensure_aware(a._alignment_date))  # pyright: ignore[reportPrivateUsage]
-            self.device_states[device_id].next_run = now
+            self.device_states[device_id].next_run = now + (i * 10)
 
         if not self.device_states:
             raise RuntimeError("No accessories with identifiers found")
@@ -93,16 +95,23 @@ class LocationSyncService:
             acc.to_json(STORE_PATH)
         return acc
 
-    async def fetch_locations(self, due_accessories: list[FindMyAccessory]) -> dict[str, list[LocationReport]]:
+    async def fetch_locations(
+        self, due_accessories: list[FindMyAccessory]
+    ) -> dict[str, list[LocationReport]]:
         try:
             locations = await self.account.fetch_location_history(due_accessories)  # pyright: ignore[reportOptionalMemberAccess]
-            self.network_backoff_exp = 0
+            self.network_fib_index = 0
         except Exception as exc:
             logging.exception("Failed to fetch location history for due devices")
             if isinstance(exc, (EmptyResponseError, OSError, asyncio.TimeoutError)):
-                self.network_backoff_exp = min(MAX_BACKOFF_EXPONENT, self.network_backoff_exp + 1)
-                delay = BASE_INTERVAL_SECONDS * (2 ** self.network_backoff_exp) + random.uniform(0, 5)
-                logging.info("Network fetch failed; global backoff exp=%d next in %.0fs", self.network_backoff_exp, delay)
+                self.network_fib_index = min(MAX_FIB_INDEX, self.network_fib_index + 1)
+                delay = BASE_INTERVAL_SECONDS * FIBONACCI_SEQUENCE[
+                    self.network_fib_index
+                ] + random.uniform(0, 5)
+                logging.info(
+                    "Network fetch failed; next retry in %.0fs",
+                    delay,
+                )
                 await asyncio.sleep(delay)
                 return {}
             else:
@@ -111,7 +120,11 @@ class LocationSyncService:
                     if did and did in self.device_states:
                         now = time.monotonic()
                         self.device_states[did].apply_backoff(now)
-                        logging.info("Device %s fetch failed; backoff exp=%d next in %.0fs", did, self.device_states[did].backoff_exp, self.device_states[did].next_run - now)
+                        logging.info(
+                            "Device %s fetch failed; next in %.0fs",
+                            did,
+                            self.device_states[did].next_run - now,
+                        )
                 return {}
 
         locations_by_id: dict[str, list[LocationReport]] = {}
@@ -122,15 +135,21 @@ class LocationSyncService:
                     locations_by_id[kid] = v
         return locations_by_id
 
-    async def upload_location(self, http_client: httpx.AsyncClient, device_id: str, location: LocationReport) -> bool:
+    async def upload_location(
+        self, http_client: httpx.AsyncClient, device_id: str, location: LocationReport
+    ) -> bool:
         confidence_str = str(location.confidence)
-        if not all(c in '01' for c in confidence_str):
-            logging.error(f"Confidence value {location.confidence} contains non-binary digits, skipping upload")
+        if not all(c in "01" for c in confidence_str):
+            logging.error(
+                f"Confidence value {location.confidence} contains non-binary digits, skipping upload"
+            )
             return False
-        
+
         confidence_int = int(confidence_str, 2)
         if confidence_int not in (0, 1, 2, 3):
-            logging.warning(f"Parsed confidence {confidence_int} is not in 0-3 range for device {device_id} at {location.timestamp.isoformat()}")
+            logging.warning(
+                f"Parsed confidence {confidence_int} is not in 0-3 range for device {device_id} at {location.timestamp.isoformat()}"
+            )
 
         data: dict[str, Any] = {
             "id": device_id,
@@ -149,11 +168,16 @@ class LocationSyncService:
             logging.exception("Error pushing location for %s", device_id)
             return False
 
-    async def process_locations(self, http_client: httpx.AsyncClient, locations_by_id: dict[str, list[LocationReport]]) -> None:
+    async def process_locations(
+        self,
+        http_client: httpx.AsyncClient,
+        locations_by_id: dict[str, list[LocationReport]],
+    ) -> None:
+        devices_to_remove: list[str] = []
         for did, state in self.device_states.items():
-            a = next((acc for acc in self.accessories if acc.identifier == did), None)
+            a = self.accessory_by_id.get(did)
             if a is None:
-                del self.device_states[did]
+                devices_to_remove.append(did)
                 continue
 
             reports = locations_by_id.get(did, [])
@@ -163,24 +187,40 @@ class LocationSyncService:
                     if ensure_aware(loc.timestamp) > state.alignment_date:
                         filtered.append(loc)  # type: ignore[reportUnknownMemberType]
                 except Exception:
-                    logging.exception("Error while comparing location timestamp; keeping location")
+                    logging.exception(
+                        "Error while comparing location timestamp; keeping location"
+                    )
                     filtered.append(loc)  # type: ignore[reportUnknownMemberType]
 
             if not filtered:
                 now = time.monotonic()
                 state.apply_backoff(now)
-                logging.info("Device ID: %s | Name: %s | No new reports; backoff exp=%d next in %.0fs", did, a.name, state.backoff_exp, state.next_run - now)
+                logging.info(
+                    "Device ID: %s | Name: %s | No new reports; next in %.0fs",
+                    did,
+                    a.name,
+                    state.next_run - now,
+                )
                 continue
 
             tasks = [self.upload_location(http_client, did, loc) for loc in filtered]  # type: ignore[reportUnknownArgument]
             results = await asyncio.gather(*tasks)
             uploaded = sum(results)
             tried = len(filtered)  # type: ignore[reportUnknownArgument]
-            logging.info("Device ID: %s | Name: %s | Uploaded: %d/%d locations", did, a.name, uploaded, tried)
+            logging.info(
+                "Device ID: %s | Name: %s | Uploaded: %d/%d locations",
+                did,
+                a.name,
+                uploaded,
+                tried,
+            )
 
             state.alignment_date = a._alignment_date  # pyright: ignore[reportPrivateUsage]
             now = time.monotonic()
             state.reset_backoff(now)
+
+        for did in devices_to_remove:
+            del self.device_states[did]
 
         out = [x.to_json(None) for x in self.accessories]
         with open(self.airtag_path, "w") as f:
@@ -194,13 +234,19 @@ class LocationSyncService:
             async with httpx.AsyncClient(http2=True, timeout=10.0) as http_client:
                 while True:
                     now = time.monotonic()
-                    due_ids = [did for did, s in self.device_states.items() if s.next_run <= now]
+                    due_ids = [
+                        did
+                        for did, s in self.device_states.items()
+                        if s.next_run <= now
+                    ]
                     if not due_ids:
                         next_run = min(s.next_run for s in self.device_states.values())
                         await asyncio.sleep(max(0, next_run - now))
                         continue
 
-                    due_accessories = [a for a in self.accessories if a.identifier in due_ids]
+                    due_accessories = [
+                        a for a in self.accessories if a.identifier in due_ids
+                    ]
                     locations_by_id = await self.fetch_locations(due_accessories)
                     await self.process_locations(http_client, locations_by_id)
 

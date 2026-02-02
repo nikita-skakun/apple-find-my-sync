@@ -6,7 +6,7 @@ description = "A set of tools to interact with the Apple Find My network."
 dependencies = [
 	"findmy>=0.9.8",
 	"httpx[http2]>=0.28.1",
-	"setuptools>=80.9.0",
+	"setuptools>=80.10.2",
 ]
 classifiers = ["Private :: Do Not Upload"]
 

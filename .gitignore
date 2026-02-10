@@ -1,8 +1,10 @@
+__pycache__/
 .venv/
+account.json
+airtag.json
+ani_libs.bin
 apple_find_my_sync.egg-info/
+build/
+dist/
 uv.lock
 venv/
-__pycache__/
-ani_libs.bin
-airtag.json
-account.json

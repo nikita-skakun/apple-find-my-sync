@@ -52,8 +52,10 @@ class LocationSyncService:
         self.accessories: list[FindMyAccessory] = []
         self.accessory_by_id: dict[str, FindMyAccessory] = {}
         self.device_states: dict[str, DeviceState] = {}
-        self.network_fib_index = 0
         self.airtag_path = "airtag.json"
+        
+        self.queue: asyncio.Queue[FindMyAccessory] = asyncio.Queue()
+        self.processing_ids: set[str] = set()
 
     async def load_accessories(self) -> None:
         if not os.path.exists(self.airtag_path):
@@ -79,6 +81,7 @@ class LocationSyncService:
             if not device_id:
                 logging.warning("Accessory %s has no identifier; skipping", a.name)
                 continue
+            # Ensure we start with a clean state from file
             self.device_states[device_id] = DeviceState(ensure_aware(a._alignment_date))  # pyright: ignore[reportPrivateUsage]
             self.device_states[device_id].next_run = now + (i * 10)
 
@@ -94,47 +97,6 @@ class LocationSyncService:
             await _login_async(acc)
             acc.to_json(STORE_PATH)
         return acc
-
-    async def fetch_locations(
-        self, due_accessories: list[FindMyAccessory]
-    ) -> dict[str, list[LocationReport]]:
-        try:
-            locations = await self.account.fetch_location_history(due_accessories)  # pyright: ignore[reportOptionalMemberAccess]
-            self.network_fib_index = 0
-        except Exception as exc:
-            if isinstance(exc, (EmptyResponseError, OSError, asyncio.TimeoutError)):
-                self.network_fib_index = min(MAX_FIB_INDEX, self.network_fib_index + 1)
-                delay = BASE_INTERVAL_SECONDS * FIBONACCI_SEQUENCE[
-                    self.network_fib_index
-                ] + random.uniform(0, 5)
-                logging.info(
-                    "Network fetch failed (%s); next retry in %.0fs",
-                    exc.__class__.__name__,
-                    delay,
-                )
-                await asyncio.sleep(delay)
-                return {}
-            else:
-                logging.exception("Failed to fetch location history for due devices")
-                for a in due_accessories:
-                    did = a.identifier
-                    if did and did in self.device_states:
-                        now = time.monotonic()
-                        self.device_states[did].apply_backoff(now)
-                        logging.info(
-                            "Device %s fetch failed; next in %.0fs",
-                            did,
-                            self.device_states[did].next_run - now,
-                        )
-                return {}
-
-        locations_by_id: dict[str, list[LocationReport]] = {}
-        for k, v in locations.items():
-            if isinstance(k, FindMyAccessory):
-                kid = k.identifier
-                if kid is not None:
-                    locations_by_id[kid] = v
-        return locations_by_id
 
     async def upload_location(
         self, http_client: httpx.AsyncClient, device_id: str, location: LocationReport
@@ -169,84 +131,135 @@ class LocationSyncService:
             logging.exception("Error pushing location for %s", device_id)
             return False
 
-    async def process_locations(
+    async def process_device_reports(
         self,
         http_client: httpx.AsyncClient,
-        locations_by_id: dict[str, list[LocationReport]],
-        due_ids: list[str],
+        acc: FindMyAccessory,
+        reports: list[LocationReport],
     ) -> None:
-        devices_to_remove: list[str] = []
-        for did in due_ids:
-            state = self.device_states.get(did)
-            if state is None:
-                continue
-            a = self.accessory_by_id.get(did)
-            if a is None:
-                devices_to_remove.append(did)
-                continue
+        did = acc.identifier
+        if not did:
+            return
+        state = self.device_states.get(did)
+        if not state:
+            return
 
-            reports = locations_by_id.get(did, [])
-            if not reports:
-                now = time.monotonic()
-                state.apply_backoff(now)
-                logging.info(
-                    "Device ID: %s | Name: %s | No reports in response; next in %.0fs",
-                    did,
-                    a.name,
-                    state.next_run - now,
-                )
-                continue
-
-            filtered: list[LocationReport] = []
-            for loc in reports:
-                try:
-                    loc_aware = ensure_aware(loc.timestamp)
-                    if loc_aware > state.alignment_date:
-                        filtered.append(loc)
-                except Exception:
-                    logging.exception(
-                        "Error while comparing location timestamp; keeping location"
-                    )
+        filtered: list[LocationReport] = []
+        for loc in reports:
+            try:
+                loc_aware = ensure_aware(loc.timestamp)
+                if loc_aware > state.alignment_date:
                     filtered.append(loc)
-
-            if not filtered:
-                now = time.monotonic()
-                state.apply_backoff(now)
-                latest_ts = max(
-                    (ensure_aware(loc.timestamp) for loc in reports), default=None
+            except Exception:
+                logging.exception(
+                    "Error while comparing location timestamp; keeping location"
                 )
-                logging.info(
-                    "Device ID: %s | Name: %s | Alignment: %s | Latest report: %s | No new reports; next in %.0fs",
-                    did,
-                    a.name,
-                    state.alignment_date.isoformat(),
-                    latest_ts.isoformat() if latest_ts else "None",
-                    state.next_run - now,
-                )
-                continue
+                filtered.append(loc)
 
-            tasks = [self.upload_location(http_client, did, loc) for loc in filtered]  # type: ignore[reportUnknownArgument]
-            results = await asyncio.gather(*tasks)
-            uploaded = sum(results)
-            tried = len(filtered)  # type: ignore[reportUnknownArgument]
-            logging.info(
-                "Device ID: %s | Name: %s | Uploaded: %d/%d locations",
-                did,
-                a.name,
-                uploaded,
-                tried,
+        now = time.monotonic()
+        if not filtered:
+            state.apply_backoff(now)
+            latest_ts = max(
+                (ensure_aware(loc.timestamp) for loc in reports), default=None
             )
+            logging.info(
+                "Device ID: %s | Name: %s | Alignment: %s | Latest report: %s | No new reports; next in %.0fs",
+                did,
+                acc.name,
+                state.alignment_date.isoformat(),
+                latest_ts.isoformat() if latest_ts else "None",
+                state.next_run - now,
+            )
+            return
 
-            state.alignment_date = a._alignment_date  # pyright: ignore[reportPrivateUsage]
-            now = time.monotonic()
-            state.reset_backoff(now)
+        tasks = [self.upload_location(http_client, did, loc) for loc in filtered]
+        results = await asyncio.gather(*tasks)
+        uploaded = sum(results)
+        tried = len(filtered)
+        logging.info(
+            "Device ID: %s | Name: %s | Uploaded: %d/%d locations",
+            did,
+            acc.name,
+            uploaded,
+            tried,
+        )
 
-        for did in devices_to_remove:
-            del self.device_states[did]
+        # Update state and persist to file
+        state.alignment_date = acc._alignment_date  # pyright: ignore[reportPrivateUsage]
+        state.reset_backoff(now)
+        
+        # Save to file specifically after successful processing
+        self.save_accessories()
 
+    def save_accessories(self) -> None:
         out = [x.to_json(None) for x in self.accessories]
         with open(self.airtag_path, "w") as f:
             json.dump(out, f, indent=4)
+
+    async def worker(self, http_client: httpx.AsyncClient) -> None:
+        logging.info("Worker started")
+        while True:
+            acc = await self.queue.get()
+            did = acc.identifier
+            if not did or did not in self.device_states:
+                self.queue.task_done()
+                if did:
+                   self.processing_ids.discard(did)
+                continue
+
+            state = self.device_states[did]
+            
+            try:
+                # Pre-Fetch Reset: Ensure we start from the last known good state
+                # This fixes the issue where a previous failed fetch might have advanced the
+                # internal cursor of the accessory object.
+                acc._alignment_date = state.alignment_date  # pyright: ignore[reportPrivateUsage]
+                
+                # Fetch
+                # fetch_location_history returns a dict. We only passed one accessory.
+                reports_dict = await self.account.fetch_location_history([acc])  # pyright: ignore[reportOptionalMemberAccess]
+                
+                # Extract reports for this accessory
+                # The key in the dict is the accessory object itself
+                reports = reports_dict.get(acc, [])
+                
+                if reports:
+                    await self.process_device_reports(http_client, acc, reports)
+                else:
+                    # Empry response logic
+                    now = time.monotonic()
+                    state.apply_backoff(now)
+                    logging.info(
+                        "Device ID: %s | Name: %s | No reports in response; next in %.0fs",
+                        did,
+                        acc.name,
+                        state.next_run - now,
+                    )
+
+            except Exception as exc:
+                # Post-Failure Reset: Rollback the internal state change that might have happened
+                # inside fetch_location_history before the exception was raised.
+                acc._alignment_date = state.alignment_date  # pyright: ignore[reportPrivateUsage]
+                
+                now = time.monotonic()
+                state.apply_backoff(now)
+                
+                if isinstance(exc, (EmptyResponseError, OSError, asyncio.TimeoutError)):
+                     logging.info(
+                        "Device ID: %s | Network fetch failed (%s); next in %.0fs",
+                        did,
+                        exc.__class__.__name__,
+                        state.next_run - now,
+                    )
+                else:
+                    logging.exception("Device ID: %s | Unexpected error during fetch", did)
+
+            finally:
+                self.processing_ids.remove(did)
+                self.queue.task_done()
+                
+                # Rate Limit: Ensure we don't hammer the API
+                await asyncio.sleep(2.0)
 
     async def run(self) -> None:
         await self.load_accessories()
@@ -254,24 +267,25 @@ class LocationSyncService:
 
         try:
             async with httpx.AsyncClient(http2=True, timeout=10.0) as http_client:
+                # Start the background worker
+                worker_task = asyncio.create_task(self.worker(http_client))
+                
+                logging.info("Service loop started")
                 while True:
                     now = time.monotonic()
-                    due_ids = [
-                        did
-                        for did, s in self.device_states.items()
-                        if s.next_run <= now
-                    ]
-                    if not due_ids:
-                        next_run = min(s.next_run for s in self.device_states.values())
-                        await asyncio.sleep(max(0, next_run - now))
-                        continue
-
-                    due_accessories = [
-                        a for a in self.accessories if a.identifier in due_ids
-                    ]
-                    locations_by_id = await self.fetch_locations(due_accessories)
-                    await self.process_locations(http_client, locations_by_id, due_ids)
-
+                    # Check for due devices
+                    for did, state in self.device_states.items():
+                        if did not in self.processing_ids and state.next_run <= now:
+                            acc = self.accessory_by_id.get(did)
+                            if acc:
+                                logging.debug("Queueing device %s", did)
+                                self.processing_ids.add(did)
+                                self.queue.put_nowait(acc)
+                    
+                    # Sleep a bit before checking simplified schedule again
+                    # We don't need accurate sleep here because the worker pulls from queue
+                    await asyncio.sleep(1.0)
+                    
         except asyncio.CancelledError:
             logging.info("Service loop cancelled")
         except KeyboardInterrupt:
@@ -325,12 +339,18 @@ def main():
     if not args.push_url:
         parser.error("Push URL must be specified via --push-url or PUSH_URL env var")
 
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S"
+    )
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
     service = LocationSyncService(args.push_url)
-    return asyncio.run(service.run())
-
+    try:
+        asyncio.run(service.run())
+    except KeyboardInterrupt:
+        pass
 
 if __name__ == "__main__":
     main()

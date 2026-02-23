@@ -9,7 +9,7 @@ dependencies = [
 	"setuptools>=82.0.0",
 ]
 classifiers = ["Private :: Do Not Upload"]
-license = {text = "MIT"}
+license = "MIT"
 
 [project.scripts]
 microservice = "microservice:main"

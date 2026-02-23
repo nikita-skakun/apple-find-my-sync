@@ -7,7 +7,6 @@ import os
 import json
 import httpx
 import time
-import random
 from typing import Any, cast
 from datetime import datetime, timezone
 
@@ -21,7 +20,7 @@ from findmy import (  # pyright: ignore[reportMissingTypeStubs]
     SmsSecondFactorMethod,
     TrustedDeviceSecondFactorMethod,
 )
-from findmy.errors import EmptyResponseError  # pyright: ignore[reportMissingTypeStubs]
+from findmy.errors import EmptyResponseError, InvalidStateError  # pyright: ignore[reportMissingTypeStubs]
 
 FIBONACCI_SEQUENCE = [1, 1, 2, 3, 5, 8, 13, 21, 34]
 MAX_FIB_INDEX = len(FIBONACCI_SEQUENCE) - 1
@@ -53,7 +52,7 @@ class LocationSyncService:
         self.accessory_by_id: dict[str, FindMyAccessory] = {}
         self.device_states: dict[str, DeviceState] = {}
         self.airtag_path = "airtag.json"
-        
+
         self.queue: asyncio.Queue[FindMyAccessory] = asyncio.Queue()
         self.processing_ids: set[str] = set()
 
@@ -187,7 +186,7 @@ class LocationSyncService:
         # Update state and persist to file
         state.alignment_date = acc._alignment_date  # pyright: ignore[reportPrivateUsage]
         state.reset_backoff(now)
-        
+
         # Save to file specifically after successful processing
         self.save_accessories()
 
@@ -204,25 +203,25 @@ class LocationSyncService:
             if not did or did not in self.device_states:
                 self.queue.task_done()
                 if did:
-                   self.processing_ids.discard(did)
+                    self.processing_ids.discard(did)
                 continue
 
             state = self.device_states[did]
-            
+
             try:
                 # Pre-Fetch Reset: Ensure we start from the last known good state
                 # This fixes the issue where a previous failed fetch might have advanced the
                 # internal cursor of the accessory object.
                 acc._alignment_date = state.alignment_date  # pyright: ignore[reportPrivateUsage]
-                
+
                 # Fetch
                 # fetch_location_history returns a dict. We only passed one accessory.
                 reports_dict = await self.account.fetch_location_history([acc])  # pyright: ignore[reportOptionalMemberAccess]
-                
+
                 # Extract reports for this accessory
                 # The key in the dict is the accessory object itself
                 reports = reports_dict.get(acc, [])
-                
+
                 if reports:
                     await self.process_device_reports(http_client, acc, reports)
                 else:
@@ -240,24 +239,41 @@ class LocationSyncService:
                 # Post-Failure Reset: Rollback the internal state change that might have happened
                 # inside fetch_location_history before the exception was raised.
                 acc._alignment_date = state.alignment_date  # pyright: ignore[reportPrivateUsage]
-                
+
                 now = time.monotonic()
                 state.apply_backoff(now)
-                
-                if isinstance(exc, (EmptyResponseError, OSError, asyncio.TimeoutError)):
-                     logging.info(
+
+                if isinstance(exc, InvalidStateError):
+                    old_path = STORE_PATH
+                    backup_path = STORE_PATH + ".old"
+                    if os.path.exists(old_path):
+                        if os.path.exists(backup_path):
+                            os.remove(backup_path)
+                        os.rename(old_path, backup_path)
+                    logging.error(
+                        "Device ID: %s | Invalid session state; moved account.json to account.json.old for re-authentication",
+                        did,
+                    )
+                    self.account = None
+                    break
+                elif isinstance(
+                    exc, (EmptyResponseError, OSError, asyncio.TimeoutError)
+                ):
+                    logging.info(
                         "Device ID: %s | Network fetch failed (%s); next in %.0fs",
                         did,
                         exc.__class__.__name__,
                         state.next_run - now,
                     )
                 else:
-                    logging.exception("Device ID: %s | Unexpected error during fetch", did)
+                    logging.exception(
+                        "Device ID: %s | Unexpected error during fetch", did
+                    )
 
             finally:
                 self.processing_ids.remove(did)
                 self.queue.task_done()
-                
+
                 # Rate Limit: Ensure we don't hammer the API
                 await asyncio.sleep(2.0)
 
@@ -268,10 +284,14 @@ class LocationSyncService:
         try:
             async with httpx.AsyncClient(http2=True, timeout=10.0) as http_client:
                 # Start the background worker
-                worker_task = asyncio.create_task(self.worker(http_client))
-                
+                asyncio.create_task(self.worker(http_client))
+
                 logging.info("Service loop started")
                 while True:
+                    if self.account is None:  # type: ignore[comparison]
+                        logging.info("Re-authenticating due to session invalidation...")
+                        self.account = await self.get_account()
+
                     now = time.monotonic()
                     # Check for due devices
                     for did, state in self.device_states.items():
@@ -281,11 +301,11 @@ class LocationSyncService:
                                 logging.debug("Queueing device %s", did)
                                 self.processing_ids.add(did)
                                 self.queue.put_nowait(acc)
-                    
+
                     # Sleep a bit before checking simplified schedule again
                     # We don't need accurate sleep here because the worker pulls from queue
                     await asyncio.sleep(1.0)
-                    
+
         except asyncio.CancelledError:
             logging.info("Service loop cancelled")
         except KeyboardInterrupt:
@@ -342,7 +362,7 @@ def main():
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%H:%M:%S"
+        datefmt="%H:%M:%S",
     )
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
@@ -351,6 +371,7 @@ def main():
         asyncio.run(service.run())
     except KeyboardInterrupt:
         pass
+
 
 if __name__ == "__main__":
     main()

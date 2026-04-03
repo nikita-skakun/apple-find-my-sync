@@ -215,12 +215,8 @@ class LocationSyncService:
                 acc._alignment_date = state.alignment_date  # pyright: ignore[reportPrivateUsage]
 
                 # Fetch
-                # fetch_location_history returns a dict. We only passed one accessory.
-                reports_dict = await self.account.fetch_location_history([acc])  # pyright: ignore[reportOptionalMemberAccess]
-
-                # Extract reports for this accessory
-                # The key in the dict is the accessory object itself
-                reports = reports_dict.get(acc, [])
+                # fetch_location_history returns a list of location reports.
+                reports = await self.account.fetch_location_history(acc)  # pyright: ignore[reportOptionalMemberAccess]
 
                 if reports:
                     await self.process_device_reports(http_client, acc, reports)

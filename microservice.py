@@ -1,15 +1,8 @@
 from __future__ import annotations
 
-import asyncio
-from collections.abc import Sequence
-import logging
-import os
-import json
-import httpx
-import time
-from typing import Any, cast
+from collections.abc import Awaitable, Sequence
 from datetime import datetime, timezone
-
+from typing import cast
 from findmy import (  # pyright: ignore[reportMissingTypeStubs]
     AsyncAppleAccount,
     FindMyAccessory,
@@ -21,12 +14,145 @@ from findmy import (  # pyright: ignore[reportMissingTypeStubs]
     TrustedDeviceSecondFactorMethod,
 )
 from findmy.errors import EmptyResponseError, InvalidStateError  # pyright: ignore[reportMissingTypeStubs]
+import asyncio
+import httpx
+import inspect
+import json
+import logging
+import os
+import time
 
-FIBONACCI_SEQUENCE = [1, 1, 2, 3, 5, 8, 13, 21, 34]
+FIBONACCI_SEQUENCE = [1, 1, 2, 3, 5, 8, 13, 21]
 MAX_FIB_INDEX = len(FIBONACCI_SEQUENCE) - 1
 BASE_INTERVAL_SECONDS = 60.0
+GLOBAL_SEND_INTERVAL_SECONDS = 2.0
 
-STORE_PATH = "account.json"
+APP_CONFIG_DIR = "apple-find-my-sync"
+USER_ACCOUNT_FILE = "account.json"
+USER_DEVICE_FILE = "devices.json"
+SendRequest = tuple[
+    int,
+    str,
+    dict[str, object],
+    dict[str, str],
+    asyncio.Future[bool],
+]
+
+
+def get_config_dir(create: bool = False) -> str:
+    base_dir = os.environ.get("XDG_CONFIG_HOME") or os.path.join(
+        os.path.expanduser("~"), ".config"
+    )
+    config_dir = os.path.join(base_dir, APP_CONFIG_DIR)
+    if create:
+        os.makedirs(config_dir, exist_ok=True)
+    return config_dir
+
+
+def discover_user_dirs(root: str | None = None) -> list[tuple[int, str, str]]:
+    if root is None:
+        root = get_config_dir()
+    users: list[tuple[int, str, str]] = []
+    for entry in sorted(os.listdir(root)):
+        if not entry.isdigit():
+            continue
+        folder = os.path.join(root, entry)
+        if not os.path.isdir(folder):
+            continue
+
+        user_id = int(entry)
+        account_path = os.path.join(folder, USER_ACCOUNT_FILE)
+        device_path = os.path.join(folder, USER_DEVICE_FILE)
+
+        if os.path.exists(account_path) and os.path.exists(device_path):
+            users.append((user_id, account_path, device_path))
+
+    if users:
+        return users
+
+    raise RuntimeError(
+        "No user directories found. Create numeric folders containing account.json and devices.json."
+    )
+
+
+def load_config(path: str | None = None) -> tuple[str, str, str]:
+    if path is None:
+        path = os.path.join(get_config_dir(), "config.json")
+    if not os.path.exists(path):
+        raise RuntimeError(f"Config file not found: {path}")
+
+    with open(path, "r") as f:
+        raw = json.load(f)
+
+    if not isinstance(raw, dict):
+        raise RuntimeError("Invalid format in config.json; expected an object")
+
+    config = cast(dict[str, object], raw)
+    traccar_push_url = config.get("traccar_push_url")
+    traccar_admin_api_url = config.get("traccar_admin_api_url")
+    traccar_admin_api_token = config.get("traccar_admin_api_token")
+
+    if not isinstance(traccar_push_url, str) or not traccar_push_url.strip():
+        raise RuntimeError(
+            "config.json must contain non-empty string: traccar_push_url"
+        )
+    if not isinstance(traccar_admin_api_url, str) or not traccar_admin_api_url.strip():
+        raise RuntimeError(
+            "config.json must contain non-empty string: traccar_admin_api_url"
+        )
+    if (
+        not isinstance(traccar_admin_api_token, str)
+        or not traccar_admin_api_token.strip()
+    ):
+        raise RuntimeError(
+            "config.json must contain non-empty string: traccar_admin_api_token"
+        )
+
+    return traccar_push_url, traccar_admin_api_url, traccar_admin_api_token
+
+
+_send_queue: asyncio.Queue[SendRequest | None] | None = None
+_send_worker_task: asyncio.Task[None] | None = None
+_send_http_clients: dict[int, httpx.AsyncClient] = {}
+_last_send_monotonic = 0.0
+
+
+async def _global_send_worker() -> None:
+    global _last_send_monotonic, _send_http_clients
+
+    if _send_queue is None:
+        return
+
+    while True:
+        item = await _send_queue.get()
+        if item is None:
+            _send_queue.task_done()
+            break
+
+        user_id, url, data, headers, future = item
+        success = False
+
+        try:
+            now = time.monotonic()
+            elapsed = now - _last_send_monotonic
+            if _last_send_monotonic > 0 and elapsed < GLOBAL_SEND_INTERVAL_SECONDS:
+                await asyncio.sleep(GLOBAL_SEND_INTERVAL_SECONDS - elapsed)
+
+            http_client = _send_http_clients.get(user_id)
+            if http_client is None:
+                http_client = httpx.AsyncClient(http2=True, timeout=10.0)
+                _send_http_clients[user_id] = http_client
+
+            resp = await http_client.post(url, data=data, headers=headers)
+            success = 200 <= resp.status_code < 300
+        except Exception:
+            logging.exception("Error pushing location to Traccar")
+            success = False
+        finally:
+            _last_send_monotonic = time.monotonic()
+            if not future.cancelled():
+                future.set_result(success)
+            _send_queue.task_done()
 
 
 class DeviceState:
@@ -45,27 +171,41 @@ class DeviceState:
 
 
 class LocationSyncService:
-    def __init__(self, push_url: str):
-        self.push_url = push_url
+    def __init__(
+        self,
+        traccar_push_url: str,
+        traccar_admin_api_url: str,
+        traccar_admin_api_token: str,
+        user_id: int = 0,
+        account_path: str | None = None,
+        device_path: str = USER_DEVICE_FILE,
+    ):
+        self.user_id = user_id
+        self.push_url = traccar_push_url
+        self.admin_url = traccar_admin_api_url
+        self.traccar_admin_api_token = traccar_admin_api_token
+        if account_path is None:
+            account_path = os.path.join(get_config_dir(), USER_ACCOUNT_FILE)
+        self.account_path = account_path
+        self.device_path = device_path
         self.account: AsyncAppleAccount | None = None
         self.accessories: list[FindMyAccessory] = []
         self.accessory_by_id: dict[str, FindMyAccessory] = {}
         self.device_states: dict[str, DeviceState] = {}
-        self.airtag_path = "airtag.json"
 
         self.queue: asyncio.Queue[FindMyAccessory] = asyncio.Queue()
         self.processing_ids: set[str] = set()
 
     async def load_accessories(self) -> None:
-        if not os.path.exists(self.airtag_path):
-            raise RuntimeError(f"Accessory file not found: {self.airtag_path}")
+        if not os.path.exists(self.device_path):
+            raise RuntimeError(f"Accessory file not found: {self.device_path}")
 
-        with open(self.airtag_path, "r") as f:
+        with open(self.device_path, "r") as f:
             raw = json.load(f)
 
         if not isinstance(raw, list):
             raise RuntimeError(
-                "Invalid format in airtag.json; expected a list of accessory mappings"
+                "Invalid format in devices.json; expected a list of accessory mappings"
             )
 
         raw_list = cast(list[FindMyAccessoryMapping], raw)
@@ -89,17 +229,17 @@ class LocationSyncService:
 
     async def get_account(self) -> AsyncAppleAccount:
         libs_path = "ani_libs.bin"
-        if os.path.exists(STORE_PATH):
-            acc = AsyncAppleAccount.from_json(STORE_PATH, anisette_libs_path=libs_path)
+        if os.path.exists(self.account_path):
+            acc = AsyncAppleAccount.from_json(
+                self.account_path, anisette_libs_path=libs_path
+            )
         else:
             acc = AsyncAppleAccount(LocalAnisetteProvider(libs_path=libs_path))
             await _login_async(acc)
-            acc.to_json(STORE_PATH)
+            acc.to_json(self.account_path)
         return acc
 
-    async def upload_location(
-        self, http_client: httpx.AsyncClient, device_id: str, location: LocationReport
-    ) -> bool:
+    async def upload_location(self, device_id: str, location: LocationReport) -> bool:
         confidence_str = str(location.confidence)
         if not all(c in "01" for c in confidence_str):
             logging.error(
@@ -113,7 +253,7 @@ class LocationSyncService:
                 f"Parsed confidence {confidence_int} is not in 0-3 range for device {device_id} at {location.timestamp.isoformat()}"
             )
 
-        data: dict[str, Any] = {
+        data: dict[str, object] = {
             "id": device_id,
             "timestamp": location.timestamp.isoformat(),
             "lat": location.latitude,
@@ -123,16 +263,28 @@ class LocationSyncService:
             "findmy_status": location.status,
         }
 
+        if _send_queue is None:
+            raise RuntimeError("Global sender is not started")
+
+        future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+        await _send_queue.put(
+            (
+                self.user_id,
+                self.push_url,
+                data,
+                {"Authorization": f"Bearer {self.traccar_admin_api_token}"},
+                future,
+            )
+        )
+
         try:
-            resp = await http_client.post(self.push_url, data=data, timeout=10.0)
-            return 200 <= resp.status_code < 300
+            return await future
         except Exception:
             logging.exception("Error pushing location for %s", device_id)
             return False
 
     async def process_device_reports(
         self,
-        http_client: httpx.AsyncClient,
         acc: FindMyAccessory,
         reports: list[LocationReport],
     ) -> None:
@@ -171,7 +323,7 @@ class LocationSyncService:
             )
             return
 
-        tasks = [self.upload_location(http_client, did, loc) for loc in filtered]
+        tasks = [self.upload_location(did, loc) for loc in filtered]
         results = await asyncio.gather(*tasks)
         uploaded = sum(results)
         tried = len(filtered)
@@ -192,10 +344,10 @@ class LocationSyncService:
 
     def save_accessories(self) -> None:
         out = [x.to_json(None) for x in self.accessories]
-        with open(self.airtag_path, "w") as f:
+        with open(self.device_path, "w") as f:
             json.dump(out, f, indent=4)
 
-    async def worker(self, http_client: httpx.AsyncClient) -> None:
+    async def worker(self) -> None:
         logging.info("Worker started")
         while True:
             acc = await self.queue.get()
@@ -219,7 +371,7 @@ class LocationSyncService:
                 reports = await self.account.fetch_location_history(acc)  # pyright: ignore[reportOptionalMemberAccess]
 
                 if reports:
-                    await self.process_device_reports(http_client, acc, reports)
+                    await self.process_device_reports(acc, reports)
                 else:
                     # Empry response logic
                     now = time.monotonic()
@@ -240,15 +392,17 @@ class LocationSyncService:
                 state.apply_backoff(now)
 
                 if isinstance(exc, InvalidStateError):
-                    old_path = STORE_PATH
-                    backup_path = STORE_PATH + ".old"
+                    old_path = self.account_path
+                    backup_path = self.account_path + ".old"
                     if os.path.exists(old_path):
                         if os.path.exists(backup_path):
                             os.remove(backup_path)
                         os.rename(old_path, backup_path)
                     logging.error(
-                        "Device ID: %s | Invalid session state; moved account.json to account.json.old for re-authentication",
+                        "Device ID: %s | Invalid session state; moved %s to %s for re-authentication",
                         did,
+                        old_path,
+                        backup_path,
                     )
                     self.account = None
                     break
@@ -277,31 +431,28 @@ class LocationSyncService:
         await self.load_accessories()
         self.account = await self.get_account()
 
+        logging.info("Service loop started")
+        asyncio.create_task(self.worker())
+
         try:
-            async with httpx.AsyncClient(http2=True, timeout=10.0) as http_client:
-                # Start the background worker
-                asyncio.create_task(self.worker(http_client))
+            while True:
+                if self.account is None:  # type: ignore[comparison]
+                    logging.info("Re-authenticating due to session invalidation...")
+                    self.account = await self.get_account()
 
-                logging.info("Service loop started")
-                while True:
-                    if self.account is None:  # type: ignore[comparison]
-                        logging.info("Re-authenticating due to session invalidation...")
-                        self.account = await self.get_account()
+                now = time.monotonic()
+                # Check for due devices
+                for did, state in self.device_states.items():
+                    if did not in self.processing_ids and state.next_run <= now:
+                        acc = self.accessory_by_id.get(did)
+                        if acc:
+                            logging.debug("Queueing device %s", did)
+                            self.processing_ids.add(did)
+                            self.queue.put_nowait(acc)
 
-                    now = time.monotonic()
-                    # Check for due devices
-                    for did, state in self.device_states.items():
-                        if did not in self.processing_ids and state.next_run <= now:
-                            acc = self.accessory_by_id.get(did)
-                            if acc:
-                                logging.debug("Queueing device %s", did)
-                                self.processing_ids.add(did)
-                                self.queue.put_nowait(acc)
-
-                    # Sleep a bit before checking simplified schedule again
-                    # We don't need accurate sleep here because the worker pulls from queue
-                    await asyncio.sleep(1.0)
-
+                # Sleep a bit before checking simplified schedule again
+                # We don't need accurate sleep here because the worker pulls from queue
+                await asyncio.sleep(1.0)
         except asyncio.CancelledError:
             logging.info("Service loop cancelled")
         except KeyboardInterrupt:
@@ -309,7 +460,7 @@ class LocationSyncService:
         finally:
             if self.account:
                 await self.account.close()
-                self.account.to_json(STORE_PATH)
+                self.account.to_json(self.account_path)
 
 
 async def _login_async(account: AsyncAppleAccount) -> None:
@@ -319,41 +470,41 @@ async def _login_async(account: AsyncAppleAccount) -> None:
     state = cast(LoginState, await account.login(email, password))  # pyright: ignore[reportUnknownMemberType]
 
     if state == LoginState.REQUIRE_2FA:  # Account requires 2FA
-        methods = cast(Sequence[Any], await account.get_2fa_methods())  # pyright: ignore[reportUnknownMemberType]
+        methods = cast(
+            Sequence[TrustedDeviceSecondFactorMethod | SmsSecondFactorMethod],
+            await account.get_2fa_methods(),  # pyright: ignore[reportUnknownMemberType]
+        )
 
         # Print the (masked) phone numbers
         for i, method in enumerate(methods):
-            if isinstance(method, TrustedDeviceSecondFactorMethod):
-                print(f"{i} - Trusted Device")
-            elif isinstance(method, SmsSecondFactorMethod):
+            if isinstance(method, SmsSecondFactorMethod):
                 print(f"{i} - SMS ({method.phone_number})")
+            else:
+                print(f"{i} - Trusted Device")
 
         ind = int(input("Method? > "))
         method = methods[ind]
-        await method.request()
+
+        await _maybe_await(method.request())
+
         code = input("Code? > ")
 
         # This automatically finishes the post-2FA login flow
-        await method.submit(code)
+        await _maybe_await(method.submit(code))
+
+
+async def _maybe_await(result: object) -> None:
+    if inspect.isawaitable(result):
+        await cast(Awaitable[object], result)
 
 
 def ensure_aware(dt: datetime) -> datetime:
     return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
 
 
-def main():
-    import argparse
-
-    parser = argparse.ArgumentParser(description="Apple Find My -> Traccar uploader")
-    parser.add_argument(
-        "--push-url",
-        default=os.environ.get("PUSH_URL"),
-        help="URL to which locations are uploaded",
-    )
-
-    args = parser.parse_args()
-    if not args.push_url:
-        parser.error("Push URL must be specified via --push-url or PUSH_URL env var")
+async def main() -> None:
+    get_config_dir(create=True)
+    traccar_push_url, traccar_admin_api_url, traccar_admin_api_token = load_config()
 
     logging.basicConfig(
         level=logging.INFO,
@@ -362,12 +513,54 @@ def main():
     )
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
-    service = LocationSyncService(args.push_url)
+    global _send_queue, _send_worker_task, _send_http_clients, _last_send_monotonic
+    _send_http_clients = {}
+    _send_queue = asyncio.Queue()
+    _last_send_monotonic = 0.0
+    _send_worker_task = asyncio.create_task(_global_send_worker())
+
+    users = discover_user_dirs()
+    services = [
+        LocationSyncService(
+            traccar_push_url,
+            traccar_admin_api_url,
+            traccar_admin_api_token,
+            user_id=user_id,
+            account_path=account_path,
+            device_path=device_path,
+        )
+        for user_id, account_path, device_path in users
+    ]
+
+    tasks: list[asyncio.Task[None]] = [
+        asyncio.create_task(service.run()) for service in services
+    ]
     try:
-        asyncio.run(service.run())
+        pending: set[asyncio.Task[None]] = set(tasks)
+        while pending:
+            done, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_EXCEPTION
+            )
+            for task in done:
+                if task.cancelled():
+                    continue
+                exc = task.exception()
+                if exc is not None:
+                    logging.exception("User service task failed", exc_info=exc)
     except KeyboardInterrupt:
-        pass
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+    finally:
+        await _send_queue.join()
+        await _send_queue.put(None)
+        await _send_worker_task
+        for http_client in _send_http_clients.values():
+            await http_client.aclose()
+        _send_queue = None
+        _send_worker_task = None
+        _send_http_clients = {}
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

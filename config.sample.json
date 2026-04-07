@@ -1,0 +1,5 @@
+{
+  "traccar_push_url": "http://example.com:5055",
+  "traccar_admin_api_url": "http://example.com:8082/api",
+  "traccar_admin_api_token": "your_admin_api_token_here"
+}

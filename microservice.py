@@ -538,9 +538,12 @@ async def main() -> None:
     try:
         pending: set[asyncio.Task[None]] = set(tasks)
         while pending:
-            done, pending = await asyncio.wait(
-                pending, return_when=asyncio.FIRST_EXCEPTION
-            )
+            try:
+                done, pending = await asyncio.wait(
+                    pending, return_when=asyncio.FIRST_EXCEPTION
+                )
+            except asyncio.CancelledError:
+                break
             for task in done:
                 if task.cancelled():
                     continue
@@ -548,10 +551,11 @@ async def main() -> None:
                 if exc is not None:
                     logging.exception("User service task failed", exc_info=exc)
     except KeyboardInterrupt:
+        logging.info("Keyboard interrupt received; shutting down")
+    finally:
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-    finally:
         await _send_queue.join()
         await _send_queue.put(None)
         await _send_worker_task
